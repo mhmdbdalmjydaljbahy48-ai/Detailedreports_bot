@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
-"""بوت تلجرام (Webhook) لنظام إدارة المتجر والديون + قسم الحياة الشخصية — نسخة الملف الواحد.
-
-التشغيل:      python bot.py          (أو gunicorn bot:application)
-المتطلبات:    pip install -r requirements.txt     (requests فقط — SQLite مضمّنة في بايثون)
-المتغيرات:    انظر env.example.txt وضعها في إعدادات المنصة
-
-هذا الملف يضم كل وحدات المشروع (config, db, tg, core, personal, ... app) داخله ويحمّلها تلقائياً.
-"""
+"""بوت تلجرام (Webhook) — النسخة النهائية الموحّدة مع كل الإضافات."""
 import importlib.abc
 import importlib.util
 import sys
@@ -14,7 +7,7 @@ import sys
 SOURCES = {}
 
 # ════════════════════ config.py ════════════════════
-SOURCES['config'] = r'''"""إعدادات البوت — كلها تُقرأ من متغيرات البيئة (Environment Variables)."""
+SOURCES['config'] = r'''"""إعدادات البوت — كلها تُقرأ من متغيرات البيئة."""
 import hashlib
 import os
 import re
@@ -78,7 +71,7 @@ class Config:
         self.ADMIN_IDS = _ids("ADMIN_IDS")
         self.CRON_SECRET = _s("CRON_SECRET")
 
-        # ── قاعدة البيانات (SQLite) ──
+        # ── قاعدة البيانات ──
         self.DB_PATH = _s("DB_PATH", "shop.db")
 
         # ── الاشتراكات ──
@@ -90,6 +83,14 @@ class Config:
         self.PAY_CONTACT_NAME = _s("PAY_CONTACT_NAME", "المهندس/ محمد")
         self.PAY_CONTACT_PHONE = _s("PAY_CONTACT_PHONE", "785068462")
         self.PAY_TRANSFER_NUMBER = _s("PAY_TRANSFER_NUMBER", "738439579")
+
+        # ── التواصل / الدعم (يظهر قبل التسجيل وبعده) ──
+        self.SUPPORT_PHONE_1 = _s("SUPPORT_PHONE_1", "738439579")
+        self.SUPPORT_PHONE_2 = _s("SUPPORT_PHONE_2", "785068462")
+        self.SUPPORT_COUNTRY_CODE = _s("SUPPORT_COUNTRY_CODE", "967")
+        self.SUPPORT_INSTAGRAM = _s("SUPPORT_INSTAGRAM", "")
+        self.SUPPORT_MESSENGER = _s("SUPPORT_MESSENGER", "")
+        self.SUPPORT_WHATSAPP_MSG = _s("SUPPORT_WHATSAPP_MSG", "مرحباً، أريد الاستفسار عن النظام")
 
         # ── عام ──
         self.MAX_PHONE = _i("MAX_PHONE", 2147483647)
@@ -113,7 +114,6 @@ from contextlib import contextmanager
 from config import cfg
 
 log = logging.getLogger("db")
-
 _local = threading.local()
 FLAGS = {"network_manual_id": True}
 
@@ -137,8 +137,7 @@ def translate_sql(sql):
         inner = m.group(1)
         upper = int(m.group(2))
         lower = int(m.group(3))
-        limit = upper - lower
-        return f"SELECT * FROM ({inner}) LIMIT {limit} OFFSET {lower}"
+        return f"SELECT * FROM ({inner}) LIMIT {upper - lower} OFFSET {lower}"
     sql = re.sub(r"(?i)SELECT \* FROM \(SELECT q\.\*, ROWNUM AS rn__ FROM \((.*?)\) q WHERE ROWNUM <= (\d+)\) WHERE rn__ > (\d+)", page_repl, sql, flags=re.DOTALL)
     sql = re.sub(r"(?i)\s*WHERE\s+ROWNUM\s*<=\s*(\d+)", r" LIMIT \1", sql)
     sql = re.sub(r"(?i)TRUNC\((SYSDATE)\s*,\s*'MM'\)", r"date('now', 'localtime', 'start of month')", sql)
@@ -233,6 +232,10 @@ def ensure_schema():
                 fail_count INTEGER DEFAULT 0 NOT NULL, locked_until DATETIME, first_name VARCHAR(100),
                 username VARCHAR(100), created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
                 last_seen DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL)"""),
+            ("bot_user_accounts", """CREATE TABLE IF NOT EXISTS bot_user_accounts (
+                telegram_id INTEGER NOT NULL, client_num INTEGER NOT NULL,
+                added_by INTEGER, added_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                PRIMARY KEY (telegram_id, client_num))"""),
             ("bot_sub_requests", """CREATE TABLE IF NOT EXISTS bot_sub_requests (
                 req_id INTEGER PRIMARY KEY, client_num INTEGER NOT NULL, telegram_id INTEGER,
                 months INTEGER NOT NULL, amount NUMERIC DEFAULT 0 NOT NULL, status VARCHAR(12) DEFAULT 'PENDING' NOT NULL,
@@ -278,7 +281,6 @@ def ensure_schema():
                 residual_amount NUMERIC, single_item_price NUMERIC, item_cost NUMERIC, profit_amount NUMERIC, import_date DATETIME DEFAULT CURRENT_TIMESTAMP)"""),
             ("system_settings", """CREATE TABLE IF NOT EXISTS system_settings (id INTEGER PRIMARY KEY, month_price NUMERIC DEFAULT 0)"""),
             ("exchange_rates", """CREATE TABLE IF NOT EXISTS exchange_rates (id INTEGER PRIMARY KEY, usd_price NUMERIC DEFAULT 0, sar_price NUMERIC DEFAULT 0)"""),
-            # ══════ جداول القسم الفردي ══════
             ("personal_expenses", """CREATE TABLE IF NOT EXISTS personal_expenses (
                 expense_id INTEGER PRIMARY KEY AUTOINCREMENT, client_num INTEGER NOT NULL,
                 category VARCHAR(50) NOT NULL, amount NUMERIC NOT NULL DEFAULT 0,
@@ -290,8 +292,7 @@ def ensure_schema():
                 notes VARCHAR(300), created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL)"""),
             ("personal_debts", """CREATE TABLE IF NOT EXISTS personal_debts (
                 pdebt_id INTEGER PRIMARY KEY AUTOINCREMENT, client_num INTEGER NOT NULL,
-                direction VARCHAR(10) NOT NULL,
-                person_name VARCHAR(100) NOT NULL, person_phone VARCHAR(30) NOT NULL,
+                direction VARCHAR(10) NOT NULL, person_name VARCHAR(100) NOT NULL, person_phone VARCHAR(30) NOT NULL,
                 amount NUMERIC NOT NULL DEFAULT 0, paid_amount NUMERIC NOT NULL DEFAULT 0,
                 reason VARCHAR(300), created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
                 last_update DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
@@ -316,18 +317,15 @@ def ensure_schema():
                 last_paid_at DATETIME, notes VARCHAR(300),
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL)"""),
         ]
-
         for name, sql in tables:
             run(sql)
             report["created"].append(name)
-
         run("""CREATE TRIGGER IF NOT EXISTS trg_clients_ins
                AFTER INSERT ON clients_table
                BEGIN UPDATE clients_table SET expiry_date = datetime(NEW.start_date, '+' || NEW.subscription_months || ' months') WHERE rowid = NEW.rowid; END;""")
         run("""CREATE TRIGGER IF NOT EXISTS trg_clients_upd
                AFTER UPDATE OF start_date, subscription_months ON clients_table
                BEGIN UPDATE clients_table SET expiry_date = datetime(NEW.start_date, '+' || NEW.subscription_months || ' months') WHERE rowid = NEW.rowid; END;""")
-
     except Exception as e:
         log.error(f"Schema Error: {e}")
         report["errors"].append(str(e))
@@ -479,6 +477,7 @@ def set_commands():
         ("cancel", "إلغاء العملية الحالية"),
         ("logout", "تسجيل الخروج"),
         ("id", "معرفة رقم حسابي في تلجرام"),
+        ("contact", "تواصل مع الإدارة"),
         ("help", "مساعدة"),
     ]
     return call("setMyCommands",
@@ -702,6 +701,38 @@ def fetch_client(num):
     return db.one(CLIENT_SQL, p_num=num)
 
 
+def user_accounts(tg_id):
+    return db.rows(
+        "SELECT bua.client_num, c.name, c.account_type, c.is_active, c.expiry_date, "
+        "(julianday(c.expiry_date) - julianday('now','localtime')) AS days_left, "
+        "c.shop_name FROM bot_user_accounts bua "
+        "JOIN clients_table c ON c.num = bua.client_num "
+        "WHERE bua.telegram_id = :t ORDER BY bua.added_at", t=tg_id)
+
+
+def link_account(tg_id, client_num, added_by=None):
+    n = db.val("SELECT COUNT(*) FROM bot_user_accounts WHERE telegram_id = :t AND client_num = :c",
+               0, t=tg_id, c=client_num)
+    if not n:
+        db.run("INSERT INTO bot_user_accounts (telegram_id, client_num, added_by) "
+               "VALUES (:t, :c, :a)", t=tg_id, c=client_num, a=added_by)
+    db.run("UPDATE bot_users SET client_num = :c WHERE telegram_id = :t", c=client_num, t=tg_id)
+
+
+def active_account(tg_id):
+    return db.val("SELECT client_num FROM bot_users WHERE telegram_id = :t", None, t=tg_id)
+
+
+def switch_account(tg_id, client_num):
+    owns = db.val("SELECT COUNT(*) FROM bot_user_accounts WHERE telegram_id = :t AND client_num = :c",
+                  0, t=tg_id, c=client_num)
+    if not owns:
+        return False
+    db.run("UPDATE bot_users SET client_num = :c, state = NULL, state_data = NULL WHERE telegram_id = :t",
+           c=client_num, t=tg_id)
+    return True
+
+
 STATE_H = {}
 CB_H = {}
 MEDIA_STATES = set()
@@ -844,10 +875,76 @@ class Ctx:
             tg.delete(self.chat_id, self.msg_id)
 '''
 
+# ════════════════════ support.py (جديد) ════════════════════
+SOURCES['support'] = r'''"""قسم التواصل بنا: هاتف + واتساب + إنستغرام + ماسنجر. يظهر قبل التسجيل وبعده وللحسابات المنتهية."""
+from __future__ import annotations
+from urllib.parse import quote
+import core
+from config import cfg
+from core import BACK_HOME, esc, on_cb, kb
+
+
+def _full_phone(num):
+    n = (num or "").strip().lstrip("+")
+    if n.startswith(cfg.SUPPORT_COUNTRY_CODE):
+        return n
+    return cfg.SUPPORT_COUNTRY_CODE + n
+
+
+def _url_kb(*rows):
+    out = []
+    for row in rows:
+        r = []
+        for item in row:
+            if item is None:
+                continue
+            t, action = item[0], item[1]
+            if action.startswith(("https://", "http://", "tg://", "tel:")):
+                r.append({"text": t, "url": action})
+            else:
+                r.append({"text": t, "callback_data": action})
+        if r:
+            out.append(r)
+    return {"inline_keyboard": out}
+
+
+def support_home(ctx, note=None):
+    p1 = cfg.SUPPORT_PHONE_1
+    p2 = cfg.SUPPORT_PHONE_2
+    full1 = _full_phone(p1)
+    full2 = _full_phone(p2)
+    wa_msg = quote(cfg.SUPPORT_WHATSAPP_MSG)
+
+    text = (("📞 <b>تواصل معنا</b>\n" if not note else note + "\n\n📞 <b>تواصل معنا</b>\n")
+            + "\nنحن هنا لمساعدتك في أي وقت.\n\n"
+            + f"<b>الهاتف الأول:</b> {esc(p1)}\n"
+            + f"<b>الهاتف الثاني:</b> {esc(p2)}\n\n"
+            + "💡 اختر قناة التواصل المناسبة لك:")
+    rows = [
+        [("💬 واتساب 1", f"https://wa.me/{full1}?text={wa_msg}"),
+         ("💬 واتساب 2", f"https://wa.me/{full2}?text={wa_msg}")],
+    ]
+    if cfg.SUPPORT_INSTAGRAM:
+        insta = cfg.SUPPORT_INSTAGRAM.lstrip("@").strip()
+        rows.append([("📸 إنستغرام", f"https://instagram.com/{insta}")])
+    if cfg.SUPPORT_MESSENGER:
+        m = cfg.SUPPORT_MESSENGER.strip()
+        m_url = m if m.startswith(("http://", "https://")) else f"https://m.me/{m}"
+        rows.append([("💬 ماسنجر", m_url)])
+    rows.append([("📞 اتصال 1", f"tel:+{full1}"), ("📞 اتصال 2", f"tel:+{full2}")])
+    rows.append([BACK_HOME])
+    ctx.reply(text, _url_kb(*rows))
+
+
+@on_cb("support")
+def cb_support(ctx):
+    support_home(ctx)
+'''
+
 # ════════════════════ menus.py ════════════════════
 SOURCES['menus'] = r'''"""القائمة الرئيسية."""
 from __future__ import annotations
-
+import core
 from core import kb, esc, on_cb
 
 
@@ -862,6 +959,11 @@ def sub_line(ctx):
     return line
 
 
+def _has_multi(ctx):
+    n = core.db.val("SELECT COUNT(*) FROM bot_user_accounts WHERE telegram_id = :t", 0, t=ctx.user_id)
+    return (n or 0) > 1
+
+
 def home(ctx, note=None):
     ctx.reset()
     c = ctx.client
@@ -873,12 +975,10 @@ def home(ctx, note=None):
         from accounts import ask_account_type
         ask_account_type(ctx)
         return
-
     title = esc(c.get("shop_name") or c.get("name") or "")
     lines = []
     if note:
-        lines.append(note)
-        lines.append("")
+        lines.append(note); lines.append("")
     lines.append("🏪 <b>%s</b>" % title if acc == "تجاري" else "👤 <b>%s</b>" % title)
     lines.append("=== أهلاً بك في نظام إدارة المتجر والديون ===")
     sl = sub_line(ctx)
@@ -887,7 +987,6 @@ def home(ctx, note=None):
     lines.append("")
     lines.append("===== القائمة الرئيسية =====")
     lines.append("اختر العملية:")
-
     if acc == "تجاري":
         rows = [
             [("🧮 حاسبة الصرف", "calc:menu"), ("📦 إضافة منتجات (استيراد)", "imp:start")],
@@ -895,7 +994,7 @@ def home(ctx, note=None):
             [("📊 التقارير والتعديلات", "rp:menu"), ("💸 تسديد الديون", "pay:menu")],
             [("⭐ اشتراكي", "sub:home"), ("🏪 حسابي", "acct:info")],
         ]
-    else:  # فردي — القسم الكامل الجديد
+    else:
         rows = [
             [("💸 المصاريف اليومية", "per:exp")],
             [("💰 الدخل والميزانية", "per:inc")],
@@ -907,6 +1006,9 @@ def home(ctx, note=None):
             [("📊 التقرير الشخصي الشامل", "per:report")],
             [("⭐ اشتراكي", "sub:home"), ("🏪 حسابي", "acct:info")],
         ]
+    if _has_multi(ctx):
+        rows.append([("🔄 تبديل الحساب", "acct:switch")])
+    rows.append([("📞 تواصل معنا", "support:home")])
     if ctx.is_admin:
         rows.append([("🛡 لوحة الإدارة الشاملة", "adm:home")])
     rows.append([("🚪 تسجيل الخروج", "acct:out")])
@@ -919,19 +1021,13 @@ def cb_m(ctx):
 '''
 
 # ════════════════════ accounts.py ════════════════════
-SOURCES['accounts'] = r'''"""الحسابات: البدء، التسجيل (شهر مجاني)، الدخول، نوع الحساب، الخروج."""
+SOURCES['accounts'] = r'''"""الحسابات: التسجيل (مرة واحدة فقط)، الدخول، النوع، الخروج، تبديل الحساب."""
 from __future__ import annotations
-
 import logging
-
-import core
-import db
-import menus
-import subs
+import core, db, menus, subs
 from config import cfg
 from core import (BACK_HOME, clean_text, duration_label, esc, fetch_client, kb, on_cb, on_state,
                   parse_int, store_password, check_password)
-
 log = logging.getLogger("accounts")
 
 COUNTRIES = ["اليمن", "السعودية", "عمان", "مصر", "الامارات", "قطر",
@@ -948,6 +1044,8 @@ def can_register(ctx):
     if db.val("SELECT COUNT(*) FROM bot_audit_log WHERE telegram_id = :p_t AND action = 'REGISTER'",
               0, p_t=ctx.user_id):
         return False, "سبق أن أنشأت حساباً من هذا الحساب في تلجرام. اضغط «تسجيل الدخول»."
+    if db.val("SELECT COUNT(*) FROM bot_user_accounts WHERE telegram_id = :p_t", 0, p_t=ctx.user_id):
+        return False, "لديك حساب مرتبط بالفعل من قبل الإدارة. اضغط «تسجيل الدخول»."
     if mode != "open":
         first_run = db.val("SELECT COUNT(*) FROM clients_table", 0) == 0
         if not first_run:
@@ -971,6 +1069,7 @@ def start(ctx, fresh=False):
         rows.append([("🆕 إنشاء حساب جديد", "auth:reg")])
     else:
         text += esc(why)
+    rows.append([("📞 تواصل معنا", "support:home")])
     (ctx.send if fresh else ctx.reply)(text, kb(*rows))
 
 
@@ -987,7 +1086,7 @@ def cb_auth(ctx):
     elif a == "reg":
         ok, why = can_register(ctx)
         if not ok:
-            ctx.reply(esc(why), kb([("🔐 تسجيل الدخول", "auth:login")]))
+            ctx.reply(esc(why), kb([("🔐 تسجيل الدخول", "auth:login")], [("📞 تواصل معنا", "support:home")]))
             return
         ctx.go("reg:name")
         ctx.reply("أدخل اسمك:", kb([("❌ إلغاء", "auth:cancel")]))
@@ -1011,8 +1110,7 @@ def register_failure(ctx):
         db.run("UPDATE bot_users SET fail_count = 0, locked_until = datetime('now', 'localtime', '+15 minutes') "
                "WHERE telegram_id = :p_t", p_t=ctx.user_id)
     else:
-        db.run("UPDATE bot_users SET fail_count = :p_n WHERE telegram_id = :p_t",
-               p_n=n, p_t=ctx.user_id)
+        db.run("UPDATE bot_users SET fail_count = :p_n WHERE telegram_id = :p_t", p_n=n, p_t=ctx.user_id)
 
 
 @on_state("login:num")
@@ -1038,9 +1136,10 @@ def st_login_pass(ctx):
         register_failure(ctx)
         ctx.reset()
         ctx.send("[خطأ]: رقم العميل أو كلمة المرور غير صحيحة!",
-                 kb([("🔁 حاول مرة أخرى", "auth:login")]))
+                 kb([("🔁 حاول مرة أخرى", "auth:login")], [("📞 تواصل معنا", "support:home")]))
         return
-    ctx.link(num)
+    core.link_account(ctx.user_id, num)
+    ctx.sess["client_num"] = num
     ctx.client = fetch_client(num)
     ctx.sub = subs.status(ctx.client)
     core.audit("LOGIN", ctx, client_num=num)
@@ -1125,12 +1224,13 @@ def st_reg_pass(ctx):
         if "UNIQUE" in str(e) or "ORA-00001" in str(e):
             ctx.reset()
             ctx.send("❌ الرقم أو الايميل مستخدم من قبل. ابدأ من جديد:",
-                     kb([("🆕 إنشاء حساب جديد", "auth:reg")]))
+                     kb([("🆕 إنشاء حساب جديد", "auth:reg")], [("📞 تواصل معنا", "support:home")]))
             return
         raise
     core.audit("REGISTER", ctx, client_num=d["num"], details="trial=%s" % months)
     num = d["num"]
-    ctx.link(num)
+    core.link_account(ctx.user_id, num)
+    ctx.sess["client_num"] = num
     ctx.client = fetch_client(num)
     ctx.sub = subs.status(ctx.client)
     ctx.reset()
@@ -1233,6 +1333,47 @@ def cb_acct(ctx):
         info(ctx)
     elif a == "out":
         logout(ctx)
+    elif a == "switch":
+        switch_list(ctx)
+    elif a == "do" and len(a) > 1 and a[1].isdigit():
+        do_switch(ctx, int(a[1]))
+
+
+def switch_list(ctx):
+    rows = core.user_accounts(ctx.user_id)
+    if len(rows) <= 1:
+        ctx.reply("لديك حساب واحد فقط.", kb([BACK_HOME]))
+        return
+    lines = ["🔄 <b>اختر الحساب:</b>", ""]
+    btns = []
+    active = core.active_account(ctx.user_id)
+    for r in rows:
+        mark = " ✅" if int(r["client_num"]) == int(active or 0) else ""
+        dl = r.get("days_left")
+        status = "⛔" if (r.get("is_active") is not None and int(r["is_active"]) == 0) else (
+            "❌" if (dl is not None and dl < 0) else "✅")
+        lines.append("%s <b>%s</b> (رقم %s)" % (status, esc(r["name"]), r["client_num"]))
+        btns.append([(mark + "👤 %s (رقم %s)" % (r["name"][:20], r["client_num"]),
+                      "acct:do:%s" % r["client_num"])])
+    btns.append([("📞 تواصل معنا", "support:home")])
+    btns.append([BACK_HOME])
+    ctx.reply("\n".join(lines), kb(*btns))
+
+
+def do_switch(ctx, num):
+    if not core.switch_account(ctx.user_id, num):
+        ctx.reply("⚠️ هذا الحساب غير مرتبط بك.", kb([("📞 تواصل معنا", "support:home"), BACK_HOME]))
+        return
+    ctx.sess["client_num"] = num
+    ctx.client = fetch_client(num)
+    ctx.sub = subs.status(ctx.client)
+    core.audit("ACCOUNT_SWITCH", ctx, client_num=num)
+    if not ctx.client:
+        return start(ctx, fresh=True)
+    if not ctx.sub["ok"]:
+        return subs.show_expired(ctx)
+    ctx.send("✅ تم التبديل إلى: <b>%s</b> (رقم %s)" % (esc(ctx.client.get("name")), num))
+    menus.home(ctx)
 
 
 def info(ctx):
@@ -1240,7 +1381,7 @@ def info(ctx):
     acc = (c.get("account_type") or "").strip()
     lines = ["🏪 <b>حسابي</b>", "",
              "الاسم: %s" % esc(c.get("name")),
-             "رقم العميل (رقم الدخول): %s" % c.get("num"),
+             "رقم العميل: %s" % c.get("num"),
              "الايميل: %s" % esc(c.get("email")),
              "نوع الحساب: %s" % esc(acc or "غير محدد")]
     if acc == "تجاري":
@@ -1250,34 +1391,37 @@ def info(ctx):
                   "الموقع: %s" % esc(c.get("location")),
                   "الدولة: %s" % esc((c.get("shop_location") or "").rstrip(":")),
                   "العملة: %s" % esc((c.get("currency") or "").rstrip(":"))]
-    lines += ["", "<b>الاشتراك</b>",
-              "ينتهي في: %s" % core.fmt_date(c.get("expiry_date"))]
+    lines += ["", "<b>الاشتراك</b>", "ينتهي في: %s" % core.fmt_date(c.get("expiry_date"))]
     s = ctx.sub or {}
     if s.get("days") is not None:
         lines.append("المتبقي: %s يوم" % int(s["days"]))
-    ctx.reply("\n".join(lines), kb([("⭐ اشتراكي", "sub:home")], [BACK_HOME]))
+    rows = [[("⭐ اشتراكي", "sub:home")]]
+    if core.db.val("SELECT COUNT(*) FROM bot_user_accounts WHERE telegram_id = :t", 0, t=ctx.user_id) > 1:
+        rows.append([("🔄 تبديل الحساب", "acct:switch")])
+    rows.append([("📞 تواصل معنا", "support:home")])
+    rows.append([BACK_HOME])
+    ctx.reply("\n".join(lines), kb(*rows))
 
 
 def logout(ctx):
     num = (ctx.client or {}).get("num")
     core.audit("LOGOUT", ctx, client_num=num)
-    ctx.unlink()
-    ctx.reply("... تم تسجيل الخروج بنجاح. العودة لشاشة الدخول 🔄")
+    db.run("UPDATE bot_users SET client_num = NULL, state = NULL, state_data = NULL WHERE telegram_id = :t",
+           t=ctx.user_id)
+    ctx.sess.update(client_num=None, state=None, data={})
+    ctx.client = None
+    ctx.sub = None
+    ctx.reply("... تم تسجيل الخروج بنجاح.")
     start(ctx, fresh=True)
 '''
 
 # ════════════════════ subs.py ════════════════════
-SOURCES['subs'] = r'''"""الاشتراكات: الحالة، الفترة التجريبية، طلبات التجديد، تفعيل المدير، التذكيرات."""
+SOURCES['subs'] = r'''"""الاشتراكات."""
 from __future__ import annotations
-
 import logging
-
-import core
-import db
-import tg
+import core, db, tg
 from config import cfg
 from core import (BACK_HOME, duration_label, esc, fmt_date, fmt_num, kb, on_cb, on_state)
-
 log = logging.getLogger("subs")
 
 STATUS_AR = {"PENDING": "⏳ قيد المراجعة", "APPROVED": "✅ تم التفعيل",
@@ -1290,13 +1434,8 @@ def status(client):
     flag = client.get("is_active")
     blocked = flag is not None and int(flag) == 0
     expired = dl is not None and dl < 0
-    return {
-        "ok": (not blocked) and (not expired),
-        "blocked": blocked,
-        "expired": expired,
-        "days": None if dl is None else int(dl),
-        "expiry": client.get("expiry_date"),
-    }
+    return {"ok": (not blocked) and (not expired), "blocked": blocked, "expired": expired,
+            "days": None if dl is None else int(dl), "expiry": client.get("expiry_date")}
 
 
 def month_price():
@@ -1306,7 +1445,7 @@ def month_price():
 def pay_text():
     return ("يرجى تحويل المبلغ ثم الاتصال بـ %s على الرقم: <b>%s</b>\n"
             "للتحويل: <b>%s</b>\n"
-            "أو إرسال رسالة برقم حسابك ليتم تفعيل النظام فوراً من قبل الإدارة."
+            "أو إرسال رسالة برقم حسابك ليتم التفعيل فوراً."
             % (esc(cfg.PAY_CONTACT_NAME), esc(cfg.PAY_CONTACT_PHONE), esc(cfg.PAY_TRANSFER_NUMBER)))
 
 
@@ -1314,7 +1453,7 @@ def show_expired(ctx):
     s = ctx.sub or {}
     if s.get("blocked"):
         ctx.reply("⛔ <b>حسابك موقوف.</b>\nيرجى التواصل مع الإدارة: <b>%s</b>" % esc(cfg.PAY_CONTACT_PHONE),
-                  kb([("🚪 تسجيل الخروج", "acct:out")]))
+                  kb([("📞 تواصل معنا", "support:home")], [("🚪 تسجيل الخروج", "acct:out")]))
         return
     text = ("==================================\n"
             "عذراً، انتهت فترة اشتراكك في النظام.\n"
@@ -1322,7 +1461,8 @@ def show_expired(ctx):
             "يرجى اختيار باقة التجديد المناسبة لك:\n"
             "==================================" % fmt_date(s.get("expiry")))
     ctx.reply(text, kb([("🔄 تجديد الاشتراك", "sub:plans")],
-                       [("📜 طلباتي", "sub:list"), ("🏪 حسابي", "acct:info")],
+                       [("📜 طلباتي", "sub:list"), ("📞 تواصل معنا", "support:home")],
+                       [("🏪 حسابي", "acct:info")],
                        [("🚪 تسجيل الخروج", "acct:out")]))
 
 
@@ -1365,7 +1505,7 @@ def home(ctx):
     lines.append("سعر الشهر: %s %s" % (fmt_num(price), cfg.SUB_PRICE_UNIT) if price else "سعر الشهر: يحدده المدير")
     ctx.reply("\n".join(lines), kb([("🔄 تجديد / تمديد الاشتراك", "sub:plans")],
                                    [("📜 طلباتي", "sub:list")],
-                                   [BACK_HOME]))
+                                   [("📞 تواصل معنا", "support:home")], [BACK_HOME]))
 
 
 def plans(ctx):
@@ -1374,13 +1514,14 @@ def plans(ctx):
     if price:
         lines.append("سعر الشهر الواحد: <b>%s</b> %s" % (fmt_num(price), cfg.SUB_PRICE_UNIT))
     else:
-        lines.append("⚠️ لم يتم تحديد سعر الاشتراك بعد، سيحدده المدير عند التفعيل.")
+        lines.append("⚠️ لم يتم تحديد سعر الاشتراك بعد.")
     lines.append("اختر الباقة:")
     btns = []
     for m in range(1, 13):
         label = duration_label(m)
         btns.append((label + (" • %s" % fmt_num(price * m) if price else ""), "sub:pick:%d" % m))
     rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([("📞 تواصل معنا", "support:home")])
     rows.append([BACK_HOME])
     ctx.reply("\n".join(lines), kb(*rows))
 
@@ -1396,8 +1537,8 @@ def pick(ctx, months):
     else:
         lines.append("المبلغ المطلوب: يحدده المدير")
     lines += ["", pay_text()]
-    ctx.reply("\n".join(lines), kb([("✅ أرسل طلب التجديد للإدارة", "sub:send:%d" % months)],
-                                   [("⬅️ الباقات", "sub:plans"), BACK_HOME]))
+    ctx.reply("\n".join(lines), kb([("✅ أرسل طلب التجديد", "sub:send:%d" % months)],
+                                   [("⬅️ الباقات", "sub:plans"), ("📞 تواصل معنا", "support:home")], [BACK_HOME]))
 
 
 def _pending(num):
@@ -1411,11 +1552,11 @@ def send_request(ctx, months):
     c = ctx.client
     pend = _pending(c["num"])
     if pend:
-        ctx.reply("لديك طلب تجديد قيد المراجعة رقم <b>#%s</b> (%s).\n"
-                  "ألغِه أولاً إذا أردت طلباً جديداً، أو أرسل إشعار التحويل."
+        ctx.reply("لديك طلب تجديد قيد المراجعة رقم <b>#%s</b> (%s).\nألغِه أولاً إذا أردت طلباً جديداً."
                   % (pend["req_id"], duration_label(pend["months"])),
                   kb([("📎 إرسال إشعار التحويل", "sub:proof:%d" % pend["req_id"])],
-                     [("🗑 إلغاء الطلب", "sub:cancel:%d" % pend["req_id"])], [BACK_HOME]))
+                     [("🗑 إلغاء الطلب", "sub:cancel:%d" % pend["req_id"])],
+                     [("📞 تواصل معنا", "support:home")], [BACK_HOME]))
         return
     amount = months * month_price()
     with db.tx() as t:
@@ -1428,9 +1569,10 @@ def send_request(ctx, months):
     notify_admins_request(ctx, rid, months, amount)
     ctx.reply("✅ تم إرسال طلب التجديد رقم <b>#%s</b> للإدارة.\n"
               "يمكنك إرفاق صورة إشعار التحويل ليتم التفعيل بسرعة." % rid,
-              kb([("📎 إرسال إشعار التحويل", "sub:proof:%d" % rid)], [BACK_HOME]))
+              kb([("📎 إرسال إشعار التحويل", "sub:proof:%d" % rid)],
+                 [("📞 تواصل معنا", "support:home")], [BACK_HOME]))
     if not cfg.ADMIN_IDS:
-        ctx.send("ℹ️ لم يتم تعيين مدير في البوت بعد، تواصل مع الإدارة مباشرة على: %s" % esc(cfg.PAY_CONTACT_PHONE))
+        ctx.send("ℹ️ تواصل مع الإدارة مباشرة على: %s" % esc(cfg.PAY_CONTACT_PHONE))
 
 
 def my_requests(ctx):
@@ -1444,7 +1586,8 @@ def my_requests(ctx):
         lines.append("#%s • %s • %s %s • %s\n    %s" % (
             r["req_id"], duration_label(r["months"]), fmt_num(r["amount"]), cfg.SUB_PRICE_UNIT,
             STATUS_AR.get(r["status"], r["status"]), core.fmt_dt(r["created_at"])))
-    ctx.reply("\n".join(lines), kb([("🔄 تجديد الاشتراك", "sub:plans")], [BACK_HOME]))
+    ctx.reply("\n".join(lines), kb([("🔄 تجديد الاشتراك", "sub:plans")],
+                                   [("📞 تواصل معنا", "support:home")], [BACK_HOME]))
 
 
 def cancel_request(ctx, rid):
@@ -1463,7 +1606,7 @@ def ask_proof(ctx, rid):
         ctx.reply("لا يوجد طلب معلّق بهذا الرقم.", kb([BACK_HOME]))
         return
     ctx.go("sub:proof", rid=rid)
-    ctx.reply("📎 أرسل الآن صورة إشعار التحويل (أو رقم العملية) لطلبك <b>#%s</b>:" % rid,
+    ctx.reply("📎 أرسل الآن صورة إشعار التحويل لطلبك <b>#%s</b>:" % rid,
               kb([("❌ إلغاء", "sub:home")]))
 
 
@@ -1477,7 +1620,7 @@ def st_proof(ctx):
         ctx.send("لا يوجد طلب معلّق بهذا الرقم.", kb([BACK_HOME]))
         return
     if not cfg.ADMIN_IDS:
-        ctx.send("لم يتم تعيين مدير في البوت. تواصل مع الإدارة: %s" % esc(cfg.PAY_CONTACT_PHONE))
+        ctx.send("لم يتم تعيين مدير. تواصل مع الإدارة: %s" % esc(cfg.PAY_CONTACT_PHONE))
         return
     c = ctx.client
     head = ("📎 <b>إشعار تحويل للطلب #%s</b>\nالعميل: %s (رقم: %s)\nالمدة: %s • المبلغ: %s %s"
@@ -1488,19 +1631,15 @@ def st_proof(ctx):
         tg.send(adm, head, markup)
         tg.forward(adm, ctx.chat_id, ctx.msg_id)
     core.audit("SUB_PROOF", ctx, details="req=%s" % rid)
-    ctx.send("✅ تم إرسال إشعار التحويل للإدارة. سيتم التفعيل بعد المراجعة.", kb([BACK_HOME]))
+    ctx.send("✅ تم إرسال إشعار التحويل للإدارة.", kb([BACK_HOME]))
 
 
 def notify_admins_request(ctx, rid, months, amount):
     c = ctx.client
     s = ctx.sub or {}
     now = "منتهي" if s.get("expired") else ("ساري — متبقي %s يوم" % int(s["days"]) if s.get("days") is not None else "ساري")
-    text = ("🔔 <b>طلب تجديد اشتراك #%s</b>\n"
-            "العميل: %s (رقم: %s)\n"
-            "المحل: %s\n"
-            "المدة: %s\n"
-            "المبلغ: %s %s\n"
-            "حالة الاشتراك الآن: %s"
+    text = ("🔔 <b>طلب تجديد اشتراك #%s</b>\nالعميل: %s (رقم: %s)\nالمحل: %s\nالمدة: %s\n"
+            "المبلغ: %s %s\nحالة الاشتراك الآن: %s"
             % (rid, esc(c.get("name")), c.get("num"), esc(c.get("shop_name") or "-"),
                duration_label(months), fmt_num(amount), cfg.SUB_PRICE_UNIT, now))
     markup = kb([("✅ تفعيل", "adm:ok:%d" % rid), ("❌ رفض", "adm:no:%d" % rid)])
@@ -1509,7 +1648,7 @@ def notify_admins_request(ctx, rid, months, amount):
 
 
 def notify_client(num, text, markup=None):
-    for r in db.rows("SELECT telegram_id FROM bot_users WHERE client_num = :p_c", p_c=num):
+    for r in db.rows("SELECT telegram_id FROM bot_user_accounts WHERE client_num = :p_c", p_c=num):
         tg.send(int(r["telegram_id"]), text, markup)
 
 
@@ -1536,7 +1675,6 @@ def grant(t, num, months, amount):
 
 
 def grant_precise(t, num, minutes=0, hours=0, days=0, months=0, amount=0):
-    """تمديد دقيق بالدقائق/الساعات/الأيام/الأشهر (يُستخدم في لوحة الإدارة الشاملة)."""
     c = t.one("SELECT expiry_date, subscription_months, "
               "(julianday(expiry_date) - julianday('now', 'localtime')) AS days_left "
               "FROM clients_table WHERE num = :p_n", p_n=num)
@@ -1549,17 +1687,12 @@ def grant_precise(t, num, minutes=0, hours=0, days=0, months=0, amount=0):
     if int(months or 0) > 0:
         parts.append("+%d months" % int(months))
     if not parts:
-        raise ValueError("لم تحدد أي مدة للإضافة")
-    # لو الاشتراك منتهي نبدأ من الآن، وإلا نمدد من تاريخ الانتهاء
+        raise ValueError("لم تحدد أي مدة")
     dl = c.get("days_left") or 0
-    if dl < 0:
-        base_expr = "datetime('now', 'localtime')"
-    else:
-        base_expr = "expiry_date"
+    base_expr = "datetime('now', 'localtime')" if dl < 0 else "expiry_date"
     modifier = ", ".join(parts)
     t.run("UPDATE clients_table SET expiry_date = datetime(%s, '%s'), is_active = 1, "
-          "money = NVL(money, 0) + :p_a WHERE num = :p_n" % (base_expr, modifier),
-          p_a=amount, p_n=num)
+          "money = NVL(money, 0) + :p_a WHERE num = :p_n" % (base_expr, modifier), p_a=amount, p_n=num)
     new_months = int(c.get("subscription_months") or 0) + int(months or 0)
     if new_months > 0:
         t.run("UPDATE clients_table SET subscription_months = :p_m, subscription_duration = :p_d WHERE num = :p_n",
@@ -1583,15 +1716,13 @@ def approve_request(ctx, rid):
                    details="req=%s months=%s amount=%s" % (rid, req["months"], req["amount"]), t=t)
     notify_client(req["client_num"],
                   "✅ <b>تم تفعيل اشتراكك</b> لمدة %s.\nينتهي في: <b>%s</b>\nشكراً لك 🌹"
-                  % (duration_label(req["months"]), fmt_date(exp)),
-                  kb([BACK_HOME]))
+                  % (duration_label(req["months"]), fmt_date(exp)), kb([BACK_HOME]))
     return req, exp
 
 
 def reject_request(ctx, rid):
     with db.tx() as t:
-        req = t.one("SELECT req_id, client_num, months, status FROM bot_sub_requests "
-                    "WHERE req_id = :p_id", p_id=rid)
+        req = t.one("SELECT req_id, client_num, months, status FROM bot_sub_requests WHERE req_id = :p_id", p_id=rid)
         if not req:
             return None, "الطلب غير موجود."
         if req["status"] != "PENDING":
@@ -1600,8 +1731,8 @@ def reject_request(ctx, rid):
               "WHERE req_id = :p_id", p_by=ctx.user_id, p_id=rid)
         core.audit("SUB_REJECTED", ctx, client_num=req["client_num"], details="req=%s" % rid, t=t)
     notify_client(req["client_num"],
-                  "❌ تم رفض طلب التجديد #%s.\nللاستفسار تواصل مع الإدارة: %s" % (rid, esc(cfg.PAY_CONTACT_PHONE)),
-                  kb([("🔄 طلب جديد", "sub:plans")]))
+                  "❌ تم رفض طلب التجديد #%s.\nللاستفسار: %s" % (rid, esc(cfg.PAY_CONTACT_PHONE)),
+                  kb([("🔄 طلب جديد", "sub:plans")], [("📞 تواصل معنا", "support:home")]))
     return req, "ok"
 
 
@@ -1632,14 +1763,12 @@ def run_reminders():
         if done:
             continue
         if kind == "EXP":
-            text = ("⛔ <b>انتهى اشتراكك</b> بتاريخ %s.\nجدّد اشتراكك لمتابعة استخدام النظام."
-                    % fmt_date(r["expiry_date"]))
+            text = "⛔ <b>انتهى اشتراكك</b> بتاريخ %s.\nجدّد للاستمرار." % fmt_date(r["expiry_date"])
         else:
             d = max(int(r["days_left"]), 0)
-            text = ("⏰ <b>تنبيه:</b> ينتهي اشتراكك بتاريخ %s (متبقي %s يوم).\n"
-                    "جدّد الآن حتى لا ينقطع النظام عنك." % (fmt_date(r["expiry_date"]), d))
-        markup = kb([("🔄 تجديد الاشتراك", "sub:plans")])
-        targets = db.rows("SELECT telegram_id FROM bot_users WHERE client_num = :p_c", p_c=r["num"])
+            text = "⏰ <b>تنبيه:</b> ينتهي اشتراكك %s (متبقي %s يوم).\nجدّد الآن." % (fmt_date(r["expiry_date"]), d)
+        markup = kb([("🔄 تجديد", "sub:plans")], [("📞 تواصل معنا", "support:home")])
+        targets = db.rows("SELECT telegram_id FROM bot_user_accounts WHERE client_num = :p_c", p_c=r["num"])
         for tt in targets:
             if tg.send(int(tt["telegram_id"]), text, markup):
                 sent += 1
@@ -1651,7 +1780,6 @@ def run_reminders():
 # ════════════════════ pickers.py ════════════════════
 SOURCES['pickers'] = r'''"""أدوات البحث والاختيار المشتركة (عملاء ومنتجات)."""
 from __future__ import annotations
-
 import db
 from config import cfg
 from core import (LIKE_ESC, esc, fmt_num, kb, like, on_cb, on_state, parse_int)
@@ -1728,7 +1856,7 @@ def cb_cp(ctx):
     d = ctx.data
     purpose, back = d.get("cp_purpose"), d.get("cp_back") or "m:home"
     if purpose not in CUST:
-        ctx.reply("انتهت صلاحية هذه الشاشة. افتح القائمة الرئيسية /menu")
+        ctx.reply("انتهت الصلاحية. افتح /menu")
         return
     act = a[0] if a else ""
     if act == "by" and len(a) > 1 and a[1] in ("name", "phone"):
@@ -1750,13 +1878,13 @@ def st_cp(ctx):
     purpose, back = d.get("cp_purpose"), d.get("cp_back") or "m:home"
     if purpose not in CUST:
         ctx.reset()
-        ctx.send("انتهت صلاحية هذه الشاشة. افتح القائمة الرئيسية /menu")
+        ctx.send("انتهت الصلاحية. افتح /menu")
         return
     cn = ctx.client["num"]
     if d.get("cp_by") == "phone":
         ph = parse_int(ctx.text, 0, cfg.MAX_PHONE)
         if ph is None:
-            ctx.send("أدخل رقماً صحيحاً (أرقام فقط):")
+            ctx.send("أدخل رقماً صحيحاً:")
             return
         rows = find_customers(cn, phone=ph)
     else:
@@ -1766,7 +1894,7 @@ def st_cp(ctx):
             return
         rows = find_customers(cn, name=q)
     if not rows:
-        ctx.send("⚠️ العميل غير موجود.", kb([("🔁 بحث آخر", "cp:again")], [("❌ إلغاء", back)]))
+        ctx.send("⚠️ غير موجود.", kb([("🔁 بحث آخر", "cp:again")], [("❌ إلغاء", back)]))
         return
     if len(rows) == 1:
         CUST[purpose](ctx, {"name": rows[0]["customer_name"], "phone": int(rows[0]["customer_phone"])})
@@ -1774,7 +1902,7 @@ def st_cp(ctx):
     btns = [[("%s (%s)" % (_short(r["customer_name"]), r["customer_phone"]), "cp:pick:%s" % r["customer_phone"])]
             for r in rows[:LIMIT]]
     btns.append([("🔁 بحث آخر", "cp:again"), ("❌ إلغاء", back)])
-    note = "\n(يوجد أكثر من %d نتيجة، حدّد الاسم بدقة أكثر)" % LIMIT if len(rows) > LIMIT else ""
+    note = "\n(يوجد أكثر من %d نتيجة)" % LIMIT if len(rows) > LIMIT else ""
     ctx.send("اختر العميل:" + note, kb(*btns))
 
 
@@ -1789,7 +1917,7 @@ def cb_pp(ctx):
     d = ctx.data
     purpose, back = d.get("pp_purpose"), d.get("pp_back") or "m:home"
     if purpose not in PROD:
-        ctx.reply("انتهت صلاحية هذه الشاشة. افتح القائمة الرئيسية /menu")
+        ctx.reply("انتهت الصلاحية. افتح /menu")
         return
     act = a[0] if a else ""
     if act == "again":
@@ -1808,16 +1936,16 @@ def st_pp(ctx):
     purpose, back = d.get("pp_purpose"), d.get("pp_back") or "m:home"
     if purpose not in PROD:
         ctx.reset()
-        ctx.send("انتهت صلاحية هذه الشاشة. افتح القائمة الرئيسية /menu")
+        ctx.send("انتهت الصلاحية. افتح /menu")
         return
     q = (ctx.text or "").strip()
     if not q:
-        ctx.send("أدخل اسم المنتج للبحث:")
+        ctx.send("أدخل اسم المنتج:")
         return
     rows = find_products(q)
     if not rows:
         extra = PROD_EXTRA.get(purpose, [])
-        ctx.send("⚠️ المنتج غير موجود.", kb(*(extra + [[("🔁 بحث آخر", "pp:again"), ("❌ إلغاء", back)]])))
+        ctx.send("⚠️ غير موجود.", kb(*(extra + [[("🔁 بحث آخر", "pp:again"), ("❌ إلغاء", back)]])))
         return
     if len(rows) == 1:
         PROD[purpose](ctx, rows[0])
@@ -1825,7 +1953,7 @@ def st_pp(ctx):
     btns = [[("%s • %s • %s حبة" % (_short(r["product_name"], 24), fmt_num(r["price"]), fmt_num(r["quantity"])),
               "pp:pick:%s" % r["product_id"])] for r in rows[:LIMIT]]
     btns.append([("🔁 بحث آخر", "pp:again"), ("❌ إلغاء", back)])
-    note = "\n(يوجد أكثر من %d نتيجة، حدّد الاسم بدقة أكثر)" % LIMIT if len(rows) > LIMIT else ""
+    note = "\n(يوجد أكثر من %d نتيجة)" % LIMIT if len(rows) > LIMIT else ""
     ctx.send("اختر المنتج:" + note, kb(*btns))
 
 
@@ -1833,80 +1961,59 @@ PROD_EXTRA = {}
 '''
 
 # ════════════════════ shop.py ════════════════════
-SOURCES['shop'] = r'''"""العمليات اليومية: حاسبة الصرف، الاستيراد، إضافة عميل، المبيعات (سلة متعددة)، الفواتير، تسديد الديون."""
+SOURCES['shop'] = r'''"""العمليات اليومية للمتجر: حاسبة الصرف، الاستيراد، إضافة عميل، المبيعات، الفواتير، تسديد الديون."""
 from __future__ import annotations
-
-import logging
-import time
-
-import core
-import db
+import logging, time
+import core, db
 from config import cfg
 from core import (BACK_HOME, CANCEL_BTN, MAX_AMOUNT, clean_text, esc, fmt_dt, fmt_num, kb,
                   on_cb, on_state, parse_float, parse_int, unit_of)
 from pickers import (PROD_EXTRA, cust_purpose, debt_totals, get_customer, prod_purpose,
                      start_cust_search, start_prod_search)
-
 log = logging.getLogger("shop")
 
 
-def _unit(ctx):
-    return unit_of(ctx.client)
+def _unit(ctx): return unit_of(ctx.client)
 
 
-# ═══════════════════ حاسبة الصرف ═══════════════════
-CALC_OPS = {
-    1: ("من دولار إلى ريال يمني", "دولار", "ريال يمني"),
-    2: ("من ريال سعودي إلى ريال يمني", "ريال سعودي", "ريال يمني"),
-    3: ("من ريال يمني إلى دولار", "ريال يمني", "دولار"),
-    4: ("من ريال يمني إلى ريال سعودي", "ريال يمني", "ريال سعودي"),
-    5: ("من دولار إلى ريال سعودي", "دولار", "ريال سعودي"),
-    6: ("من ريال سعودي إلى دولار", "ريال سعودي", "دولار"),
-}
+CALC_OPS = {1: ("من دولار إلى ريال يمني", "دولار", "ريال يمني"),
+            2: ("من ريال سعودي إلى ريال يمني", "ريال سعودي", "ريال يمني"),
+            3: ("من ريال يمني إلى دولار", "ريال يمني", "دولار"),
+            4: ("من ريال يمني إلى ريال سعودي", "ريال يمني", "ريال سعودي"),
+            5: ("من دولار إلى ريال سعودي", "دولار", "ريال سعودي"),
+            6: ("من ريال سعودي إلى دولار", "ريال سعودي", "دولار")}
 
 
 def get_rates():
     r = db.one("SELECT usd_price, sar_price FROM exchange_rates WHERE id = 1")
-    if not r:
-        return 0.0, 0.0
+    if not r: return 0.0, 0.0
     return float(r["usd_price"] or 0), float(r["sar_price"] or 0)
 
 
 def convert(op, amount, usd, sar):
-    if op == 1:
-        return amount * usd
-    if op == 2:
-        return amount * sar
-    if op == 3:
-        return amount / usd
-    if op == 4:
-        return amount / sar
-    if op == 5:
-        return amount * (usd / sar)
+    if op == 1: return amount * usd
+    if op == 2: return amount * sar
+    if op == 3: return amount / usd
+    if op == 4: return amount / sar
+    if op == 5: return amount * (usd / sar)
     return amount * (sar / usd)
 
 
 @on_cb("calc")
 def cb_calc(ctx):
-    a = ctx.args
-    act = a[0] if a else "menu"
+    a = ctx.args; act = a[0] if a else "menu"
     usd, sar = get_rates()
     if usd == 0 or sar == 0:
-        rows = [[BACK_HOME]]
-        if ctx.is_admin:
-            rows.insert(0, [("💱 تحديث أسعار الصرف", "adm:rates")])
-        ctx.reply("عذراً، لا يمكن تشغيل الحاسبة لعدم توفر أسعار الصرف الحالية.", kb(*rows))
-        return
+        rows = [[("📞 تواصل معنا", "support:home"), BACK_HOME]]
+        if ctx.is_admin: rows.insert(0, [("💱 تحديث أسعار الصرف", "adm:rates")])
+        ctx.reply("لا يمكن تشغيل الحاسبة لعدم توفر أسعار الصرف.", kb(*rows)); return
     if act == "op" and len(a) > 1 and a[1].isdigit() and int(a[1]) in CALC_OPS:
         op = int(a[1])
         ctx.go("calc:amt", op=op)
-        ctx.reply("%s\nأدخل المبلغ:" % CALC_OPS[op][0], kb([("⬅️ رجوع", "calc:menu")]))
-        return
+        ctx.reply("%s\nأدخل المبلغ:" % CALC_OPS[op][0], kb([("⬅️ رجوع", "calc:menu")])); return
     ctx.reset()
-    lines = ["=== 🧮 حاسبة الصرف الآلية ===",
-             "💵 الدولار = %s ريال يمني" % fmt_num(usd),
-             "🇸🇦 الريال السعودي = %s ريال يمني" % fmt_num(sar), "",
-             "اختر العملية المطلوبة:"]
+    lines = ["=== 🧮 حاسبة الصرف ===", "💵 الدولار = %s ريال يمني" % fmt_num(usd),
+             "🇸🇦 الريال السعودي = %s ريال يمني" % fmt_num(sar), "", "اختر العملية:"]
     rows = [[(CALC_OPS[i][0], "calc:op:%d" % i)] for i in range(1, 7)]
     rows.append([BACK_HOME])
     ctx.reply("\n".join(lines), kb(*rows))
@@ -1917,20 +2024,16 @@ def st_calc(ctx):
     op = ctx.data.get("op")
     amount = parse_float(ctx.text, 0.0, 1e12)
     if op not in CALC_OPS or amount is None or amount <= 0:
-        ctx.send("أدخل مبلغاً صحيحاً (رقم أكبر من صفر):")
-        return
+        ctx.send("أدخل مبلغاً صحيحاً:"); return
     usd, sar = get_rates()
     if usd == 0 or sar == 0:
-        ctx.reset()
-        ctx.send("عذراً، لا يمكن تشغيل الحاسبة لعدم توفر أسعار الصرف الحالية.")
-        return
+        ctx.reset(); ctx.send("لا يمكن تشغيل الحاسبة."); return
     res = convert(op, amount, usd, sar)
     _, src, dst = CALC_OPS[op]
     ctx.send("🧮 %s %s\n<b>النتيجة: %s %s</b>" % (fmt_num(amount), src, fmt_num(res), dst),
              kb([("🔁 عملية أخرى", "calc:menu")], [BACK_HOME]))
 
 
-# ═══════════════════ إضافة عميل ═══════════════════
 @on_cb("cust")
 def cb_cust(ctx):
     if (ctx.args[0] if ctx.args else "") == "add":
@@ -1941,194 +2044,147 @@ def cb_cust(ctx):
 @on_state("cust:name")
 def st_cust_name(ctx):
     name = clean_text(ctx.text, 100, True)
-    if not name:
-        ctx.send("أدخل اسم العميل (حتى 50 حرفاً):")
-        return
-    ctx.go("cust:phone", c_name=name)
-    ctx.send("أدخل رقم العميل:")
+    if not name: ctx.send("أدخل اسم العميل:"); return
+    ctx.go("cust:phone", c_name=name); ctx.send("أدخل رقم العميل:")
 
 
 @on_state("cust:phone")
 def st_cust_phone(ctx):
     ph = parse_int(ctx.text, 1, cfg.MAX_PHONE)
-    if ph is None:
-        ctx.send("أدخل رقماً صحيحاً (أرقام فقط، بدون مفتاح الدولة):")
-        return
-    cn = ctx.client["num"]
-    name = ctx.data.get("c_name")
+    if ph is None: ctx.send("أدخل رقماً صحيحاً:"); return
+    cn = ctx.client["num"]; name = ctx.data.get("c_name")
     old = db.one("SELECT customer_name, client_num FROM shop_customers WHERE customer_phone = :p_ph", p_ph=ph)
     if old:
         if int(old["client_num"]) == int(cn):
-            ctx.send("❌ هذا الرقم مسجل مسبقاً باسم: <b>%s</b>. أدخل رقماً آخر:" % esc(old["customer_name"]))
-        else:
-            ctx.send("❌ هذا الرقم مسجل مسبقاً. أدخل رقماً آخر:")
+            ctx.send("❌ الرقم مسجل باسم: <b>%s</b>. أدخل رقماً آخر:" % esc(old["customer_name"]))
+        else: ctx.send("❌ الرقم مسجل مسبقاً. أدخل رقماً آخر:")
         return
     try:
         db.run("INSERT INTO shop_customers (customer_phone, customer_name, client_num) "
                "VALUES (:p_ph, :p_n, :p_cn)", p_ph=ph, p_n=name, p_cn=cn)
     except Exception as e:
         if "UNIQUE" in str(e) or "ORA-00001" in str(e):
-            ctx.send("❌ هذا الرقم مسجل مسبقاً. أدخل رقماً آخر:")
-            return
+            ctx.send("❌ الرقم مسجل. أدخل رقماً آخر:"); return
         raise
     core.audit("CUSTOMER_ADD", ctx, details="%s %s" % (ph, name))
     ctx.reset()
-    ctx.send("✅ تم إضافة العميل بنجاح!\n👤 %s — 📞 %s" % (esc(name), ph),
+    ctx.send("✅ تم إضافة العميل: %s — %s" % (esc(name), ph),
              kb([("👤 إضافة عميل آخر", "cust:add")], [BACK_HOME]))
 
 
-# ═══════════════════ الاستيراد ═══════════════════
 PROD_EXTRA["imp"] = [[("🆕 إضافته كمنتج جديد", "imp:asnew")]]
 
 
 @on_cb("imp")
 def cb_imp(ctx):
-    a = ctx.args
-    act = a[0] if a else "start"
+    a = ctx.args; act = a[0] if a else "start"
     if act == "start":
         ctx.reset()
-        ctx.reply("📦 <b>إضافة منتجات (استيراد)</b>\nهل المنتج موجود سابقاً؟",
-                  kb([("🆕 لا، منتج جديد", "imp:new"), ("📦 نعم، موجود", "imp:old")], [BACK_HOME]))
+        ctx.reply("📦 <b>إضافة منتجات (استيراد)</b>\nهل المنتج موجود؟",
+                  kb([("🆕 جديد", "imp:new"), ("📦 موجود", "imp:old")], [BACK_HOME]))
     elif act in ("new", "asnew"):
         ctx.go("imp:newname", i_mode="new", i_pid=None)
         ctx.reply("أدخل اسم المنتج الجديد:", kb([CANCEL_BTN]))
     elif act == "old":
-        start_prod_search(ctx, "imp", prompt="ادخل اسم المنتج (أو جزء منه) للبحث:")
-    elif act == "p0" and ctx.state == "imp:profit":
-        _after_profit(ctx, 0.0)
+        start_prod_search(ctx, "imp", prompt="ادخل اسم المنتج للبحث:")
+    elif act == "p0" and ctx.state == "imp:profit": _after_profit(ctx, 0.0)
     elif act == "pay" and ctx.state == "imp:paid" and len(a) > 1:
         _after_paid(ctx, float(ctx.data.get("i_full") or 0) if a[1] == "full" else 0.0)
-    elif act == "ok":
-        save_import(ctx)
+    elif act == "ok": save_import(ctx)
 
 
 @prod_purpose("imp")
 def imp_picked(ctx, p):
     ctx.go("imp:merchant", i_mode="old", i_pid=p["product_id"], i_name=p["product_name"])
-    ctx.reply("📦 المنتج المختار: <b>%s</b>\nالسعر الحالي: %s | المتوفر: %s\n\nأدخل اسم التاجر/المورد:"
+    ctx.reply("📦 المنتج: <b>%s</b>\nالسعر: %s | المتوفر: %s\n\nأدخل اسم التاجر:"
               % (esc(p["product_name"]), fmt_num(p["price"]), fmt_num(p["quantity"])), kb([CANCEL_BTN]))
 
 
 @on_state("imp:newname")
 def st_imp_newname(ctx):
     name = clean_text(ctx.text, 100, True)
-    if not name:
-        ctx.send("أدخل اسم المنتج (حتى 50 حرفاً):")
-        return
-    ex = db.one("SELECT product_id, product_name FROM products_table WHERE LOWER(product_name) = :p_n",
-                p_n=name.lower())
+    if not name: ctx.send("أدخل اسم المنتج:"); return
+    ex = db.one("SELECT product_id, product_name FROM products_table WHERE LOWER(product_name) = :p_n", p_n=name.lower())
     if ex:
         ctx.go("imp:merchant", i_mode="old", i_pid=ex["product_id"], i_name=ex["product_name"])
-        ctx.send("ℹ️ المنتج [<b>%s</b>] موجود مسبقاً، سيتم تحديثه.\n\nأدخل اسم التاجر/المورد:"
-                 % esc(ex["product_name"]), kb([CANCEL_BTN]))
-        return
+        ctx.send("ℹ️ المنتج موجود، سيتم تحديثه.\nأدخل اسم التاجر:", kb([CANCEL_BTN])); return
     ctx.go("imp:merchant", i_mode="new", i_pid=None, i_name=name)
-    ctx.send("أدخل اسم التاجر/المورد:", kb([CANCEL_BTN]))
+    ctx.send("أدخل اسم التاجر:", kb([CANCEL_BTN]))
 
 
 @on_state("imp:merchant")
 def st_imp_merchant(ctx):
     m = clean_text(ctx.text, 100, True)
-    if not m:
-        ctx.send("أدخل اسم التاجر/المورد (حتى 50 حرفاً):")
-        return
-    ctx.go("imp:cartons", i_merchant=m)
-    ctx.send("أدخل عدد الكراتين:")
+    if not m: ctx.send("أدخل اسم التاجر:"); return
+    ctx.go("imp:cartons", i_merchant=m); ctx.send("أدخل عدد الكراتين:")
 
 
 @on_state("imp:cartons")
 def st_imp_cartons(ctx):
     v = parse_int(ctx.text, 1, 1_000_000)
-    if v is None:
-        ctx.send("أدخل عدداً صحيحاً أكبر من صفر:")
-        return
-    ctx.go("imp:inside", i_cartons=v)
-    ctx.send("أدخل العدد داخل الكرتون الواحد:")
+    if v is None: ctx.send("أدخل عدداً صحيحاً:"); return
+    ctx.go("imp:inside", i_cartons=v); ctx.send("أدخل العدد داخل الكرتون:")
 
 
 @on_state("imp:inside")
 def st_imp_inside(ctx):
     v = parse_int(ctx.text, 1, 100_000)
-    if v is None:
-        ctx.send("أدخل عدداً صحيحاً أكبر من صفر:")
-        return
-    ctx.go("imp:price", i_inside=v)
-    ctx.send("أدخل سعر الكرتون الواحد:")
+    if v is None: ctx.send("أدخل عدداً صحيحاً:"); return
+    ctx.go("imp:price", i_inside=v); ctx.send("أدخل سعر الكرتون:")
 
 
 @on_state("imp:price")
 def st_imp_price(ctx):
     p = parse_float(ctx.text, 0.0)
-    if p is None:
-        ctx.send("أدخل سعراً صحيحاً (رقم):")
-        return
+    if p is None: ctx.send("أدخل سعراً صحيحاً:"); return
     d = ctx.data
     full = round(d["i_cartons"] * p, 2)
-    if full > MAX_AMOUNT:
-        ctx.send("إجمالي الفاتورة كبير جداً. تحقق من الأرقام وأعد إدخال سعر الكرتون:")
-        return
+    if full > MAX_AMOUNT: ctx.send("الإجمالي كبير. أعد إدخال السعر:"); return
     cost = round(p / d["i_inside"], 2)
     ctx.go("imp:profit", i_price=p, i_full=full, i_cost=cost)
     u = _unit(ctx)
-    ctx.send("[النظام]: إجمالي مبلغ الفاتورة = <b>%s</b> %s\n"
-             "[النظام]: تكلفة الحبة الواحدة عليك = <b>%s</b>\n\n"
-             "أدخل مبلغ الربح للحبة الواحدة (أو 0 لبيعها برأس المال):" % (fmt_num(full), u, fmt_num(cost)),
-             kb([("0️⃣ بيعها برأس المال", "imp:p0")], [CANCEL_BTN]))
+    ctx.send("[النظام]: إجمالي الفاتورة = <b>%s</b> %s\nتكلفة الحبة = <b>%s</b>\n\nأدخل ربح الحبة (أو 0):"
+             % (fmt_num(full), u, fmt_num(cost)),
+             kb([("0️⃣ بدون ربح", "imp:p0")], [CANCEL_BTN]))
 
 
 def _after_profit(ctx, profit):
     d = ctx.data
     single = round(d["i_cost"] + profit, 2)
-    if single > MAX_AMOUNT:
-        ctx.send("سعر البيع كبير جداً. أدخل ربحاً أقل:")
-        return
+    if single > MAX_AMOUNT: ctx.send("السعر كبير. أدخل ربحاً أقل:"); return
     ctx.go("imp:paid", i_profit=profit, i_single=single)
-    ctx.reply("[النظام]: السعر النهائي لبيع الحبة الواحدة = <b>%s</b>\n\nأدخل المبلغ المدفوع للتاجر:"
-              % fmt_num(single),
-              kb([("💵 دفعت كامل المبلغ", "imp:pay:full"), ("⏳ لم أدفع شيئاً", "imp:pay:none")], [CANCEL_BTN]))
+    ctx.reply("[النظام]: سعر البيع = <b>%s</b>\n\nأدخل المبلغ المدفوع للتاجر:" % fmt_num(single),
+              kb([("💵 دفعت كامل المبلغ", "imp:pay:full"), ("⏳ لم أدفع", "imp:pay:none")], [CANCEL_BTN]))
 
 
 @on_state("imp:profit")
 def st_imp_profit(ctx):
     v = parse_float(ctx.text, 0.0)
-    if v is None:
-        ctx.send("أدخل مبلغ الربح (0 أو أكثر):")
-        return
+    if v is None: ctx.send("أدخل مبلغ الربح:"); return
     _after_profit(ctx, v)
 
 
 def _after_paid(ctx, paid):
-    d = ctx.data
-    full = float(d["i_full"])
+    d = ctx.data; full = float(d["i_full"])
     if paid > full + 0.001:
-        ctx.send("المبلغ المدفوع أكبر من إجمالي الفاتورة (%s). أعد الإدخال:" % fmt_num(full))
-        return
-    paid = round(paid, 2)
-    resid = round(full - paid, 2)
+        ctx.send("المبلغ أكبر من الإجمالي (%s). أعد الإدخال:" % fmt_num(full)); return
+    paid = round(paid, 2); resid = round(full - paid, 2)
     ctx.go("imp:confirm", i_paid=paid)
     u = _unit(ctx)
     total_qty = d["i_cartons"] * d["i_inside"]
-    text = ("🧾 <b>ملخص فاتورة التوريد</b>\n"
-            "التاجر: %s\n"
-            "المنتج: %s (%s)\n"
-            "الكراتين: %s × %s حبة = %s حبة\n"
-            "سعر الكرتون: %s\n"
-            "إجمالي الفاتورة: <b>%s</b> %s\n"
-            "المدفوع: %s | المتبقي (دين آجل): <b>%s</b>\n"
-            "تكلفة الحبة: %s | الربح: %s | سعر البيع: <b>%s</b>"
-            % (esc(d["i_merchant"]), esc(d["i_name"]), "جديد" if d["i_mode"] == "new" else "موجود",
-               fmt_num(d["i_cartons"]), fmt_num(d["i_inside"]), fmt_num(total_qty),
-               fmt_num(d["i_price"]), fmt_num(full), u, fmt_num(paid), fmt_num(resid),
+    text = ("🧾 <b>ملخص فاتورة التوريد</b>\nالتاجر: %s\nالمنتج: %s\nالكراتين: %s × %s = %s حبة\n"
+            "سعر الكرتون: %s\nالإجمالي: <b>%s</b> %s\nالمدفوع: %s | المتبقي: <b>%s</b>\n"
+            "التكلفة: %s | الربح: %s | البيع: <b>%s</b>"
+            % (esc(d["i_merchant"]), esc(d["i_name"]), fmt_num(d["i_cartons"]), fmt_num(d["i_inside"]),
+               fmt_num(total_qty), fmt_num(d["i_price"]), fmt_num(full), u, fmt_num(paid), fmt_num(resid),
                fmt_num(d["i_cost"]), fmt_num(d["i_profit"]), fmt_num(d["i_single"])))
-    ctx.reply(text, kb([("✅ حفظ الفاتورة", "imp:ok")], [CANCEL_BTN]))
+    ctx.reply(text, kb([("✅ حفظ", "imp:ok")], [CANCEL_BTN]))
 
 
 @on_state("imp:paid")
 def st_imp_paid(ctx):
     v = parse_float(ctx.text, 0.0)
-    if v is None:
-        ctx.send("أدخل المبلغ المدفوع (0 أو أكثر):")
-        return
+    if v is None: ctx.send("أدخل المدفوع:"); return
     _after_paid(ctx, v)
 
 
@@ -2136,12 +2192,9 @@ def save_import(ctx):
     d = ctx.data
     need = ["i_mode", "i_name", "i_merchant", "i_cartons", "i_inside", "i_price", "i_full",
             "i_cost", "i_profit", "i_single", "i_paid"]
-    if d.get("i_mode") == "old":
-        need.append("i_pid")
+    if d.get("i_mode") == "old": need.append("i_pid")
     if ctx.state != "imp:confirm" or any(d.get(k) is None for k in need):
-        ctx.reply("انتهت صلاحية هذه الفاتورة. ابدأ من جديد.",
-                  kb([("📦 توريد جديد", "imp:start")], [BACK_HOME]))
-        return
+        ctx.reply("انتهت الصلاحية. ابدأ من جديد.", kb([("📦 توريد جديد", "imp:start")], [BACK_HOME])); return
     cn = ctx.client["num"]
     total_qty = d["i_cartons"] * d["i_inside"]
     resid = round(d["i_full"] - d["i_paid"], 2)
@@ -2162,132 +2215,99 @@ def save_import(ctx):
                 n = t.run("UPDATE products_table SET price = :p_sp, selling_price = :p_sp, "
                           "purchase_price = :p_pp, quantity = NVL(quantity, 0) + :p_q, "
                           "units_per_carton = :p_u WHERE product_id = :p_id",
-                          p_sp=d["i_single"], p_pp=d["i_cost"], p_q=total_qty, p_u=d["i_inside"],
-                          p_id=d["i_pid"])
-                if n == 0:
-                    raise ValueError("المنتج لم يعد موجوداً")
+                          p_sp=d["i_single"], p_pp=d["i_cost"], p_q=total_qty, p_u=d["i_inside"], p_id=d["i_pid"])
+                if n == 0: raise ValueError("المنتج لم يعد موجوداً")
             core.audit("IMPORT", ctx, details="%s x%s paid=%s" % (d["i_name"], total_qty, d["i_paid"]), t=t)
     except ValueError as e:
-        ctx.reset()
-        ctx.reply("⚠️ %s" % esc(e), kb([("📦 توريد جديد", "imp:start")], [BACK_HOME]))
-        return
+        ctx.reset(); ctx.reply("⚠️ %s" % esc(e), kb([("📦 توريد جديد", "imp:start")], [BACK_HOME])); return
     except Exception as e:
         if "UNIQUE" in str(e) or "ORA-00001" in str(e):
             ctx.reset()
-            ctx.reply("❌ يوجد منتج بنفس الاسم مسبقاً. ابدأ من جديد واختر «منتج موجود».",
-                      kb([("📦 توريد جديد", "imp:start")], [BACK_HOME]))
-            return
+            ctx.reply("❌ يوجد منتج بنفس الاسم. ابدأ من جديد.",
+                      kb([("📦 توريد جديد", "imp:start")], [BACK_HOME])); return
         raise
-    u = _unit(ctx)
-    name, single, mode = d["i_name"], d["i_single"], d["i_mode"]
+    u = _unit(ctx); name, single, mode = d["i_name"], d["i_single"], d["i_mode"]
     ctx.reset()
-    ctx.reply("✅ تم حفظ فاتورة التوريد وتفاصيل الأرباح بنجاح!\n" +
-              ("📦 تم إدراج [<b>%s</b>] بسعر (%s) للحبة في قائمة منتجات المحل." % (esc(name), fmt_num(single))
+    ctx.reply("✅ تم حفظ فاتورة التوريد!\n" +
+              ("📦 تم إدراج [<b>%s</b>] بسعر %s للحبة." % (esc(name), fmt_num(single))
                if mode == "new" else
-               "🔄 تم تحديث سعر [<b>%s</b>] إلى (%s) %s للحبة وإضافة %s حبة للمخزون."
-               % (esc(name), fmt_num(single), u, fmt_num(total_qty))),
+               "🔄 تم تحديث [<b>%s</b>] إلى %s %s وأُضيف %s حبة." % (esc(name), fmt_num(single), u, fmt_num(total_qty))),
               kb([("📦 توريد جديد", "imp:start")], [BACK_HOME]))
 
 
-# ═══════════════════ المبيعات (سلة متعددة) ═══════════════════
 KIND_LABEL = {"d": "آجلة (دين)", "c": "كاش", "n": "شبكة"}
 GENERAL = {"c": "عميل كاش عام", "n": "عميل شبكة عام"}
 TABLE = {"c": "cash_sales", "n": "network_sales"}
 
 
-def _cart(ctx):
-    return ctx.data.setdefault("cart", [])
-
-
-def _cart_total(cart):
-    return round(sum(float(x.get("total", 0)) for x in cart), 2)
+def _cart(ctx): return ctx.data.setdefault("cart", [])
+def _cart_total(cart): return round(sum(float(x.get("total", 0)) for x in cart), 2)
 
 
 def _cart_summary(cart, u):
     lines = []
     for i, x in enumerate(cart, 1):
-        lines.append("%d. %s × %s = %s %s" % (i, esc(x["pname"]), fmt_num(x["qty"]),
-                                              fmt_num(x["total"]), u))
+        lines.append("%d. %s × %s = %s %s" % (i, esc(x["pname"]), fmt_num(x["qty"]), fmt_num(x["total"]), u))
     return "\n".join(lines)
 
 
 @on_cb("sale")
 def cb_sale(ctx):
-    a = ctx.args
-    act = a[0] if a else "menu"
-    st = ctx.state
+    a = ctx.args; act = a[0] if a else "menu"; st = ctx.state
     if act == "menu":
         ctx.reset()
-        ctx.reply("--- 🛒 قسم المبيعات ---\nاختر نوع العملية:",
-                  kb([("📝 دين", "sale:type:d")], [("💰 كاش", "sale:type:c"), ("💳 شبكة", "sale:type:n")],
-                     [BACK_HOME]))
+        ctx.reply("--- 🛒 قسم المبيعات ---\nاختر النوع:",
+                  kb([("📝 دين", "sale:type:d")], [("💰 كاش", "sale:type:c"), ("💳 شبكة", "sale:type:n")], [BACK_HOME]))
     elif act == "type" and len(a) > 1 and a[1] in KIND_LABEL:
         kind = a[1]
-        ctx.reset()
-        ctx.put(s_type=kind, cart=[], s_cname=None, s_cphone=None)
-        if kind == "d":
-            start_cust_search(ctx, "sale", back="sale:menu")
+        ctx.reset(); ctx.put(s_type=kind, cart=[], s_cname=None, s_cphone=None)
+        if kind == "d": start_cust_search(ctx, "sale", back="sale:menu")
         else:
             ctx.go("sale:cname", s_type=kind)
-            ctx.reply("أدخل اسم الزبون (أو اضغط تخطي لتسجيله كـ «%s»):" % GENERAL[kind],
+            ctx.reply("أدخل اسم الزبون (أو تخطي):",
                       kb([("⏭ تخطي", "sale:skip:name")], [("❌ إلغاء", "sale:menu")]))
     elif act == "skip" and len(a) > 1:
         kind = ctx.data.get("s_type")
         if a[1] == "name" and st == "sale:cname" and kind in GENERAL:
             ctx.go("sale:cphone", s_cname=GENERAL[kind])
-            ctx.reply("أدخل رقم هاتف الزبون (أو اضغط تخطي):", kb([("⏭ تخطي", "sale:skip:phone")],
-                                                              [("❌ إلغاء", "sale:menu")]))
+            ctx.reply("أدخل هاتف الزبون (أو تخطي):",
+                      kb([("⏭ تخطي", "sale:skip:phone")], [("❌ إلغاء", "sale:menu")]))
         elif a[1] == "phone" and st == "sale:cphone":
-            ctx.put(s_cphone=0)
-            start_prod_search(ctx, "sale", back="sale:menu")
-    elif act == "add" and st == "sale:qty":
-        # بعد تأكيد الكمية: نسأل هل يريد إضافة منتج آخر؟
-        _confirm_add_to_cart(ctx, ctx.data["s_qty"])
+            ctx.put(s_cphone=0); start_prod_search(ctx, "sale", back="sale:menu")
+    elif act == "add" and st == "sale:qty": _confirm_add_to_cart(ctx, ctx.data["s_qty"])
     elif act == "neg" and len(a) > 1 and st == "sale:negq":
-        if a[1] == "y":
-            _confirm_add_to_cart(ctx, ctx.data["s_qty"])
-        else:
-            _back_to_cart(ctx)
-    elif act == "more":
-        start_prod_search(ctx, "sale", back="sale:menu",
-                          prompt="أدخل اسم المنتج التالي للبحث:")
+        if a[1] == "y": _confirm_add_to_cart(ctx, ctx.data["s_qty"])
+        else: _back_to_cart(ctx)
+    elif act == "more": start_prod_search(ctx, "sale", back="sale:menu", prompt="أدخل اسم المنتج التالي:")
     elif act == "del" and len(a) > 1 and a[1].isdigit():
-        idx = int(a[1])
-        cart = _cart(ctx)
-        if 0 <= idx < len(cart):
-            cart.pop(idx)
-            ctx.put(cart=cart)
+        idx = int(a[1]); cart = _cart(ctx)
+        if 0 <= idx < len(cart): cart.pop(idx); ctx.put(cart=cart)
         _back_to_cart(ctx)
-    elif act == "ok":
-        _save_sale(ctx)
+    elif act == "ok": _save_sale(ctx)
 
 
 @on_state("sale:cname")
 def st_sale_cname(ctx):
     name = clean_text(ctx.text, 100, True)
     if not name:
-        ctx.send("أدخل اسم الزبون (حتى 50 حرفاً) أو اضغط تخطي:", kb([("⏭ تخطي", "sale:skip:name")]))
-        return
+        ctx.send("أدخل اسم الزبون (أو تخطي):", kb([("⏭ تخطي", "sale:skip:name")])); return
     ctx.go("sale:cphone", s_cname=name)
-    ctx.send("أدخل رقم هاتف الزبون (أو اضغط تخطي):",
-             kb([("⏭ تخطي", "sale:skip:phone")], [("❌ إلغاء", "sale:menu")]))
+    ctx.send("أدخل هاتف الزبون (أو تخطي):", kb([("⏭ تخطي", "sale:skip:phone")], [("❌ إلغاء", "sale:menu")]))
 
 
 @on_state("sale:cphone")
 def st_sale_cphone(ctx):
     ph = parse_int(ctx.text, 0, 999_999_999_999_999)
     if ph is None:
-        ctx.send("أدخل رقماً صحيحاً (أرقام فقط) أو اضغط تخطي:", kb([("⏭ تخطي", "sale:skip:phone")]))
-        return
-    ctx.put(s_cphone=ph)
-    start_prod_search(ctx, "sale", back="sale:menu")
+        ctx.send("أدخل رقماً صحيحاً (أو تخطي):", kb([("⏭ تخطي", "sale:skip:phone")])); return
+    ctx.put(s_cphone=ph); start_prod_search(ctx, "sale", back="sale:menu")
 
 
 @cust_purpose("sale")
 def sale_cust_picked(ctx, c):
     ctx.put(s_cname=c["name"], s_cphone=c["phone"])
     start_prod_search(ctx, "sale", back="sale:menu",
-                      prompt="👤 تم اختيار العميل: <b>%s</b>\n\nأدخل اسم المنتج للبحث:" % esc(c["name"]))
+                      prompt="👤 العميل: <b>%s</b>\n\nأدخل اسم المنتج للبحث:" % esc(c["name"]))
 
 
 @prod_purpose("sale")
@@ -2295,7 +2315,7 @@ def sale_prod_picked(ctx, p):
     ctx.go("sale:qty", s_pid=p["product_id"], s_pname=p["product_name"], s_price=float(p["price"]),
            s_stock=int(p["quantity"]), s_cost=float(p["purchase_price"]),
            s_units=int(p["units_per_carton"] or 1))
-    ctx.reply("📦 المنتج: <b>%s</b>\nالسعر: %s %s | المتوفر: %s\n\nأدخل الكمية المطلوبة:"
+    ctx.reply("📦 <b>%s</b>\nالسعر: %s %s | المتوفر: %s\n\nأدخل الكمية:"
               % (esc(p["product_name"]), fmt_num(p["price"]), _unit(ctx),
                  core.stock_text(p["quantity"], p["units_per_carton"])),
               kb([("❌ إلغاء", "sale:menu")]))
@@ -2304,16 +2324,12 @@ def sale_prod_picked(ctx, p):
 @on_state("sale:qty")
 def st_sale_qty(ctx):
     q = parse_int(ctx.text, 1, 1_000_000)
-    if q is None:
-        ctx.send("أدخل كمية صحيحة (عدد صحيح أكبر من صفر):")
-        return
+    if q is None: ctx.send("أدخل كمية صحيحة:"); return
     stock = ctx.data.get("s_stock", 0)
     if q > stock:
         ctx.go("sale:negq", s_qty=q)
-        ctx.send("⚠️ تنبيه: الكمية المطلوبة غير متوفرة! (المتبقي: %s فقط)\n"
-                 "هل تريد مواصلة البيع وتقييد المخزون بالسالب؟" % fmt_num(stock),
-                 kb([("✅ نعم، واصل", "sale:neg:y"), ("❌ لا، إلغاء", "sale:neg:n")]))
-        return
+        ctx.send("⚠️ الكمية غير متوفرة! (المتبقي: %s)\nهل تريد المواصلة بالسالب؟" % fmt_num(stock),
+                 kb([("✅ نعم", "sale:neg:y"), ("❌ لا", "sale:neg:n")])); return
     _confirm_add_to_cart(ctx, q)
 
 
@@ -2321,31 +2337,21 @@ def _confirm_add_to_cart(ctx, qty):
     d = ctx.data
     total = round(qty * d["s_price"], 2)
     if total > MAX_AMOUNT:
-        ctx.go("sale:qty")
-        ctx.reply("الإجمالي كبير جداً. أدخل كمية أقل:")
-        return
+        ctx.go("sale:qty"); ctx.reply("الإجمالي كبير. أدخل كمية أقل:"); return
     cart = _cart(ctx)
-    cart.append({
-        "pid": d["s_pid"], "pname": d["s_pname"], "qty": qty,
-        "price": d["s_price"], "cost": d.get("s_cost", 0), "total": total,
-    })
-    ctx.put(cart=cart)
-    _back_to_cart(ctx)
+    cart.append({"pid": d["s_pid"], "pname": d["s_pname"], "qty": qty,
+                 "price": d["s_price"], "cost": d.get("s_cost", 0), "total": total})
+    ctx.put(cart=cart); _back_to_cart(ctx)
 
 
 def _back_to_cart(ctx):
-    d = ctx.data
-    cart = _cart(ctx)
-    u = _unit(ctx)
+    d = ctx.data; cart = _cart(ctx); u = _unit(ctx)
     if not cart:
-        ctx.go(None)
-        ctx.reply("🛒 السلة فارغة. ابدأ من جديد:", kb([("🛒 المبيعات", "sale:menu"), BACK_HOME]))
-        return
+        ctx.go(None); ctx.reply("🛒 السلة فارغة.", kb([("🛒 المبيعات", "sale:menu"), BACK_HOME])); return
     gt = _cart_total(cart)
     lines = ["🛒 <b>سلة المشتريات (%s)</b>" % KIND_LABEL[d["s_type"]],
              "العميل: %s" % esc(d.get("s_cname") or GENERAL.get(d["s_type"], "")), "",
-             _cart_summary(cart, u), "",
-             "الإجمالي: <b>%s</b> %s" % (fmt_num(gt), u)]
+             _cart_summary(cart, u), "", "الإجمالي: <b>%s</b> %s" % (fmt_num(gt), u)]
     btns = []
     for i, x in enumerate(cart):
         btns.append([("🗑 حذف %d) %s" % (i + 1, x["pname"][:20]), "sale:del:%d" % i)])
@@ -2362,18 +2368,15 @@ def _new_invoice(t):
         used = t.val("SELECT COUNT(*) FROM (SELECT invoice_num FROM cash_sales WHERE invoice_num = :p_n "
                      "UNION ALL SELECT invoice_num FROM network_sales WHERE invoice_num = :p_n "
                      "UNION ALL SELECT invoice_num FROM shop_debts WHERE invoice_num = :p_n)", 0, p_n=n)
-        if not used:
-            return n
+        if not used: return n
         time.sleep(0.003)
-    raise RuntimeError("تعذر توليد رقم فاتورة فريد، حاول مرة أخرى")
+    raise RuntimeError("تعذر توليد رقم فاتورة")
 
 
 def _save_sale(ctx):
-    d = ctx.data
-    cart = _cart(ctx)
+    d = ctx.data; cart = _cart(ctx)
     if not cart or d.get("s_type") not in KIND_LABEL:
-        ctx.reply("انتهت صلاحية هذه العملية. ابدأ من جديد.", kb([("🛒 المبيعات", "sale:menu"), BACK_HOME]))
-        return
+        ctx.reply("انتهت الصلاحية.", kb([("🛒 المبيعات", "sale:menu"), BACK_HOME])); return
     kind, cn = d["s_type"], ctx.client["num"]
     cname = core.fit_bytes(d.get("s_cname") or GENERAL.get(kind, ""), 100)
     cphone = int(d.get("s_cphone") or 0)
@@ -2381,17 +2384,14 @@ def _save_sale(ctx):
         with db.tx() as t:
             inv = _new_invoice(t)
             for item in cart:
-                pname = core.fit_bytes(item["pname"], 100)
-                qty = int(item["qty"])
-                price = float(item["price"])
-                total = float(item["total"])
+                pname = core.fit_bytes(item["pname"], 100); qty = int(item["qty"])
+                price = float(item["price"]); total = float(item["total"])
                 profit = round((price - float(item.get("cost", 0))) * qty, 2)
                 if kind == "d":
                     t.run("INSERT INTO shop_debts (client_num, customer_phone, customer_name, product_name, "
                           "quantity, single_price, debt_amount, invoice_num, debt_date) "
                           "VALUES (:p_cn, :p_ph, :p_cu, :p_pn, :p_q, :p_pr, :p_tot, :p_inv, SYSTIMESTAMP)",
-                          p_cn=cn, p_ph=cphone, p_cu=cname, p_pn=pname, p_q=qty, p_pr=price,
-                          p_tot=total, p_inv=inv)
+                          p_cn=cn, p_ph=cphone, p_cu=cname, p_pn=pname, p_q=qty, p_pr=price, p_tot=total, p_inv=inv)
                 else:
                     cols = ("client_num, customer_name, customer_phone, product_name, quantity, single_price, "
                             "total_amount, invoice_num, sale_date, profit_amount")
@@ -2403,17 +2403,12 @@ def _save_sale(ctx):
                           p_tot=total, p_inv=inv, p_pf=profit)
                 n = t.run("UPDATE products_table SET quantity = NVL(quantity, 0) - :p_q WHERE product_id = :p_id",
                           p_q=qty, p_id=item["pid"])
-                if n == 0:
-                    raise ValueError("المنتج [%s] لم يعد موجوداً" % item["pname"])
+                if n == 0: raise ValueError("المنتج [%s] لم يعد موجوداً" % item["pname"])
             core.audit("SALE_" + kind.upper(), ctx,
                        details="inv=%s items=%s total=%s" % (inv, len(cart), _cart_total(cart)), t=t)
     except ValueError as e:
-        ctx.reset()
-        ctx.reply("⚠️ %s" % esc(e), kb([("🛒 المبيعات", "sale:menu"), BACK_HOME]))
-        return
-    gt = _cart_total(cart)
-    u = _unit(ctx)
-    ctx.reset()
+        ctx.reset(); ctx.reply("⚠️ %s" % esc(e), kb([("🛒 المبيعات", "sale:menu"), BACK_HOME])); return
+    gt = _cart_total(cart); u = _unit(ctx); ctx.reset()
     head = ("✅ تم تسجيل الدين! رقم الفاتورة: <b>%s</b>" if kind == "d"
             else "✅ تم الحفظ! رقم الفاتورة: <b>%s</b>") % inv
     lines = ["====================================", "          فاتورة مبيعات             ",
@@ -2427,10 +2422,9 @@ def _save_sale(ctx):
               "====================================", "        شكراً لتسوقكم معنا!         "]
     ctx.reply(head + "\n\n" + "\n".join(esc(x) for x in lines),
               kb([("🖨️ ملف الفاتورة", "inv:%s:%s" % (kind, inv))],
-                 [("🛒 عملية بيع جديدة", "sale:menu"), BACK_HOME]))
+                 [("🛒 عملية جديدة", "sale:menu"), BACK_HOME]))
 
 
-# ═══════════════════ الفواتير ═══════════════════
 INV_SQL = {
     "d": "SELECT customer_name, product_name, quantity, single_price, debt_amount AS total, debt_date AS dt "
          "FROM shop_debts WHERE invoice_num = :p_n AND client_num = :p_cn",
@@ -2444,19 +2438,15 @@ INV_SQL = {
 @on_cb("inv")
 def cb_inv(ctx):
     a = ctx.args
-    if len(a) < 2 or a[0] not in INV_SQL or not a[1].isdigit():
-        return
+    if len(a) < 2 or a[0] not in INV_SQL or not a[1].isdigit(): return
     kind, num = a[0], int(a[1])
     rows = db.rows(INV_SQL[kind], p_n=num, p_cn=ctx.client["num"])
     if not rows:
-        ctx.send("⚠️ لم يتم العثور على الفاتورة.")
-        return
-    u = unit_of(ctx.client)
-    shop = (ctx.client or {}).get("shop_name")
+        ctx.send("⚠️ لم يتم العثور على الفاتورة."); return
+    u = unit_of(ctx.client); shop = (ctx.client or {}).get("shop_name")
     L = ["====================================", "          فاتورة مبيعات             ",
          "===================================="]
-    if shop:
-        L.append("المحل: %s" % shop)
+    if shop: L.append("المحل: %s" % shop)
     r0 = rows[0]
     L += ["رقم الفاتورة: %s" % num, "نوع الفاتورة: %s" % KIND_LABEL[kind],
           "اسم العميل: %s" % r0["customer_name"], "التاريخ: %s" % fmt_dt(r0["dt"]),
@@ -2472,7 +2462,6 @@ def cb_inv(ctx):
     ctx.doc("Invoice_%s.txt" % num, "\n".join(L), caption="🖨️ فاتورة رقم %s" % num)
 
 
-# ═══════════════════ تسديد الديون ═══════════════════
 def archive_and_delete_debts(t, cn, phone, reason):
     t.run("INSERT INTO bot_debts_archive (debt_id, client_num, customer_phone, customer_name, product_name, "
           "quantity, single_price, debt_amount, paid_amount, debt_date, invoice_num, reason) "
@@ -2485,47 +2474,36 @@ def archive_and_delete_debts(t, cn, phone, reason):
 
 @on_cb("pay")
 def cb_pay(ctx):
-    a = ctx.args
-    act = a[0] if a else "menu"
+    a = ctx.args; act = a[0] if a else "menu"
     if act == "menu":
         ctx.reset()
         ctx.reply("===== 💸 قسم تسديد الديون =====",
-                  kb([("💸 تسديد ديون", "pay:go")], [("📝 كشف الديون (حالة الرصيد)", "pay:bal")], [BACK_HOME]))
-    elif act == "go":
-        start_cust_search(ctx, "pay", back="pay:menu")
-    elif act == "bal":
-        start_cust_search(ctx, "bal", back="pay:menu")
+                  kb([("💸 تسديد ديون", "pay:go")], [("📝 كشف الديون", "pay:bal")], [BACK_HOME]))
+    elif act == "go": start_cust_search(ctx, "pay", back="pay:menu")
+    elif act == "bal": start_cust_search(ctx, "bal", back="pay:menu")
     elif len(a) > 1 and a[1].isdigit():
-        phone = int(a[1])
-        cn = ctx.client["num"]
+        phone = int(a[1]); cn = ctx.client["num"]
         cust = get_customer(cn, phone)
         if not cust:
-            ctx.reply("⚠️ العميل غير موجود.", kb([("↩️ رجوع", "pay:menu")]))
-            return
-        if act == "det":
-            _debt_details(ctx, cust)
+            ctx.reply("⚠️ العميل غير موجود.", kb([("↩️ رجوع", "pay:menu")])); return
+        if act == "det": _debt_details(ctx, cust)
         elif act == "do":
             ctx.go("pay:amt", pay_phone=phone)
-            ctx.reply("أدخل المبلغ الذي سيسدده العميل الآن:", kb([("❌ إلغاء", "pay:menu")]))
-        elif act == "full":
-            _settle_full(ctx, cust)
+            ctx.reply("أدخل المبلغ الذي سيسدده:", kb([("❌ إلغاء", "pay:menu")]))
+        elif act == "full": _settle_full(ctx, cust)
 
 
 @cust_purpose("pay")
 def pay_cust_picked(ctx, c):
-    cn = ctx.client["num"]
-    td, tp, rem = debt_totals(c["phone"], cn)
-    u = _unit(ctx)
+    cn = ctx.client["num"]; td, tp, rem = debt_totals(c["phone"], cn); u = _unit(ctx)
     if rem <= 0:
         ctx.reset()
-        ctx.reply("✅ العميل [<b>%s</b>] ليس عليه أي ديون مسجلة (حسابه مصفر)." % esc(c["name"]),
-                  kb([("↩️ رجوع", "pay:menu"), BACK_HOME]))
+        ctx.reply("✅ العميل [<b>%s</b>] ليس عليه ديون." % esc(c["name"]), kb([("↩️ رجوع", "pay:menu"), BACK_HOME]))
         return
     ctx.reset()
-    ctx.reply("👤 اسم العميل: <b>%s</b>\n📞 رقم العميل: %s\n💰 إجمالي الدين المتبقي عليه: <b>%s</b> %s"
-              % (esc(c["name"]), c["phone"], fmt_num(rem), u),
-              kb([("📋 كشف تفاصيل الدين", "pay:det:%s" % c["phone"])],
-                 [("💸 تسديد الدين", "pay:do:%s" % c["phone"])], [("↩️ رجوع", "pay:menu")]))
+    ctx.reply("👤 <b>%s</b>\n📞 %s\n💰 المتبقي: <b>%s</b> %s" % (esc(c["name"]), c["phone"], fmt_num(rem), u),
+              kb([("📋 كشف التفاصيل", "pay:det:%s" % c["phone"])],
+                 [("💸 تسديد", "pay:do:%s" % c["phone"])], [("↩️ رجوع", "pay:menu")]))
 
 
 def _debt_details(ctx, cust):
@@ -2536,41 +2514,34 @@ def _debt_details(ctx, cust):
     u = _unit(ctx)
     lines = ["--- 📋 تفاصيل الديون: <b>%s</b> ---" % esc(cust["name"])]
     for r in rows:
-        lines.append("- %s | الكمية: %s | المبلغ: %s %s | التاريخ: %s%s"
+        lines.append("- %s | %s | %s %s | %s%s"
                      % (esc(r["product_name"]), fmt_num(r["quantity"]), fmt_num(r["debt_amount"]), u,
-                        fmt_dt(r["debt_date"]), " | فاتورة: %s" % r["invoice_num"] if r.get("invoice_num") else ""))
+                        fmt_dt(r["debt_date"]),
+                        " | فاتورة: %s" % r["invoice_num"] if r.get("invoice_num") else ""))
     td, tp, rem = debt_totals(cust["phone"], cn)
-    lines += ["", "إجمالي الدين: %s | المسدد: %s | المتبقي: <b>%s</b> %s" % (fmt_num(td), fmt_num(tp), fmt_num(rem), u)]
-    ctx.reply("\n".join(lines), kb([("💸 تسديد الدين", "pay:do:%s" % cust["phone"])], [("↩️ رجوع", "pay:menu")]))
+    lines += ["", "الإجمالي: %s | المسدد: %s | المتبقي: <b>%s</b> %s"
+              % (fmt_num(td), fmt_num(tp), fmt_num(rem), u)]
+    ctx.reply("\n".join(lines), kb([("💸 تسديد", "pay:do:%s" % cust["phone"])], [("↩️ رجوع", "pay:menu")]))
 
 
 @on_state("pay:amt")
 def st_pay_amt(ctx):
     amt = parse_float(ctx.text, 0.0)
-    if amt is None or amt <= 0:
-        ctx.send("أدخل مبلغاً صحيحاً أكبر من صفر:")
-        return
-    cn = ctx.client["num"]
-    phone = ctx.data.get("pay_phone")
+    if amt is None or amt <= 0: ctx.send("أدخل مبلغاً أكبر من صفر:"); return
+    cn = ctx.client["num"]; phone = ctx.data.get("pay_phone")
     cust = get_customer(cn, phone) if phone is not None else None
     if not cust:
-        ctx.reset()
-        ctx.send("⚠️ العميل غير موجود.", kb([("↩️ رجوع", "pay:menu")]))
-        return
-    td, tp, rem = debt_totals(phone, cn)
-    u = _unit(ctx)
+        ctx.reset(); ctx.send("⚠️ العميل غير موجود.", kb([("↩️ رجوع", "pay:menu")])); return
+    td, tp, rem = debt_totals(phone, cn); u = _unit(ctx)
     if rem <= 0:
-        ctx.reset()
-        ctx.send("✅ العميل [<b>%s</b>] ليس عليه أي ديون مسجلة." % esc(cust["name"]), kb([BACK_HOME]))
-        return
+        ctx.reset(); ctx.send("✅ ليس عليه ديون.", kb([BACK_HOME])); return
     amt = round(amt, 2)
     if amt >= rem - 0.001:
-        extra = "\nالمبلغ المستلم أكبر من المتبقي بـ %s %s (الزيادة تُرجع للعميل)." % (fmt_num(amt - rem), u) if amt > rem + 0.001 else ""
+        extra = "\nالمبلغ أكبر من المتبقي بـ %s %s." % (fmt_num(amt - rem), u) if amt > rem + 0.001 else ""
         ctx.go("pay:fullq", pay_phone=phone)
-        ctx.send("سيتم تسديد كامل الدين (<b>%s</b> %s) وتصفير حساب العميل.%s\n"
-                 "<i>(تُنقل سجلات الديون إلى الأرشيف ثم تُحذف من القائمة)</i>\nتأكيد؟"
+        ctx.send("سيتم تسديد كامل الدين (<b>%s</b> %s) وتصفير الحساب.%s\nتأكيد؟"
                  % (fmt_num(rem), u, extra),
-                 kb([("✅ تأكيد التسديد الكامل", "pay:full:%s" % phone)], [("❌ إلغاء", "pay:menu")]))
+                 kb([("✅ تأكيد", "pay:full:%s" % phone)], [("❌ إلغاء", "pay:menu")]))
         return
     with db.tx() as t:
         t.run("UPDATE shop_debts SET paid_amount = NVL(paid_amount, 0) + :p_a WHERE debt_id = "
@@ -2578,220 +2549,194 @@ def st_pay_amt(ctx):
               p_a=amt, p_ph=phone, p_cn=cn)
         core.audit("DEBT_PAY", ctx, details="phone=%s amount=%s" % (phone, amt), t=t)
     ctx.reset()
-    ctx.send("✅ تم تسجيل الدفعة بنجاح! المتبقي عليه الآن: <b>%s</b> %s" % (fmt_num(rem - amt), u),
+    ctx.send("✅ تم تسجيل الدفعة! المتبقي: <b>%s</b> %s" % (fmt_num(rem - amt), u),
              kb([("💸 تسديد آخر", "pay:go")], [BACK_HOME]))
 
 
 def _settle_full(ctx, cust):
-    cn = ctx.client["num"]
-    td, tp, rem = debt_totals(cust["phone"], cn)
+    cn = ctx.client["num"]; td, tp, rem = debt_totals(cust["phone"], cn)
     if rem <= 0:
-        ctx.reply("✅ العميل [<b>%s</b>] ليس عليه أي ديون مسجلة." % esc(cust["name"]), kb([BACK_HOME]))
-        return
+        ctx.reply("✅ ليس عليه ديون.", kb([BACK_HOME])); return
     with db.tx() as t:
         n = archive_and_delete_debts(t, cn, cust["phone"], "PAID_FULL")
         core.audit("DEBT_FULL", ctx, details="phone=%s paid=%s rows=%s" % (cust["phone"], rem, n), t=t)
     ctx.reset()
-    ctx.reply("✅ تم تسديد الدين بالكامل وتصفير جميع سجلات العميل بنجاح!",
-              kb([("💸 تسديد آخر", "pay:go")], [BACK_HOME]))
+    ctx.reply("✅ تم تسديد الدين بالكامل!", kb([("💸 تسديد آخر", "pay:go")], [BACK_HOME]))
 
 
 @cust_purpose("bal")
 def bal_cust_picked(ctx, c):
-    cn = ctx.client["num"]
-    td, tp, rem = debt_totals(c["phone"], cn)
-    u = _unit(ctx)
+    cn = ctx.client["num"]; td, tp, rem = debt_totals(c["phone"], cn); u = _unit(ctx)
     ctx.reset()
-    lines = ["--- 📝 كشف رصيد الديون للعميل [<b>%s</b>] ---" % esc(c["name"])]
-    if td == 0:
-        lines.append("✅ العميل سدد بالكامل، وسجلاته مصفرة (لا يوجد عليه دين حالياً).")
+    lines = ["--- 📝 كشف رصيد: <b>%s</b> ---" % esc(c["name"])]
+    if td == 0: lines.append("✅ سدد بالكامل.")
     else:
-        lines += ["مجموع الدين كان: %s %s" % (fmt_num(td), u), "سدد منه: %s %s" % (fmt_num(tp), u),
-                  "المتبقي عليه: <b>%s</b> %s" % (fmt_num(rem), u)]
+        lines += ["مجموع الدين: %s %s" % (fmt_num(td), u), "المسدد: %s %s" % (fmt_num(tp), u),
+                  "المتبقي: <b>%s</b> %s" % (fmt_num(rem), u)]
     ctx.reply("\n".join(lines), kb([("📝 كشف آخر", "pay:bal")], [("↩️ رجوع", "pay:menu"), BACK_HOME]))
 '''
 
-# ════════════════════ personal.py ════════════════════
-SOURCES['personal'] = r'''"""القسم الفردي الشامل: مصاريف، دخل، ديون شخصية (لي/عليّ)، مذكرات، أهداف، التزامات، تقرير شامل.
-
-كل حركة تُحفظ بالتاريخ والوقت الدقيق عبر CURRENT_TIMESTAMP.
-الديون تُدمج تلقائياً عند تكرار (الاسم + الرقم + الاتجاه).
-"""
+# ════════════════════ personal.py (مُصلح) ════════════════════
+SOURCES['personal'] = r'''"""القسم الفردي الشامل — نسخة مصححة (معالج واحد فقط لـ per)."""
 from __future__ import annotations
-
 import logging
 from urllib.parse import quote
-
-import core
-import db
+import core, db
 from config import cfg
 from core import (BACK_HOME, esc, fmt_dt, fmt_num, kb, on_cb, on_state, parse_float, parse_int)
-
 log = logging.getLogger("personal")
 
 EXPENSE_CATS = {
-    "food": "🍔 أكل ومطاعم",
-    "transport": "🚕 مواصلات",
-    "grocery": "🛒 مقاضي البيت",
-    "bills": "💡 فواتير واتصالات",
-    "health": "💊 صحة وعلاج",
-    "fun": "☕ كافيهات وترفيه",
-    "gifts": "🎁 هدايا",
-    "other": "📌 مصاريف أخرى",
+    "food": "🍔 أكل ومطاعم", "transport": "🚕 مواصلات", "grocery": "🛒 مقاضي البيت",
+    "bills": "💡 فواتير واتصالات", "health": "💊 صحة وعلاج", "fun": "☕ كافيهات وترفيه",
+    "gifts": "🎁 هدايا", "other": "📌 مصاريف أخرى",
 }
 
 
-def _cn(ctx):
-    return ctx.client["num"]
+def _cn(ctx): return ctx.client["num"]
+def _u(ctx): return core.unit_of(ctx.client)
+def _month_cond(): return "date(created_at) >= date('now', 'localtime', 'start of month')"
+def _today_cond(): return "date(created_at) = date('now', 'localtime')"
 
 
-def _u(ctx):
-    return core.unit_of(ctx.client)
-
-
-def _month_start_cond():
-    return "date(created_at) >= date('now', 'localtime', 'start of month')"
-
-
-def _today_cond():
-    return "date(created_at) = date('now', 'localtime')"
-
-
-# ═══════════════════ المصاريف ═══════════════════
+# ═══════════════════ المعالج الوحيد لكل أزرار القسم الفردي ═══════════════════
 @on_cb("per")
 def cb_per(ctx):
     a = ctx.args
-    act = a[0] if a else "menu"
-    st = ctx.state
-    if act == "menu":
-        # قائمة فردي عامة
+    section = a[0] if a else "menu"
+    action = a[1] if len(a) > 1 else ""
+    arg = a[2] if len(a) > 2 else ""
+
+    # ── القائمة الرئيسية ──
+    if section == "menu":
         ctx.reset()
         ctx.reply("👤 <b>القسم الفردي الشامل</b>\nاختر القسم:",
                   kb([("💸 المصاريف", "per:exp")], [("💰 الدخل", "per:inc")],
                      [("💼 المحفظة", "per:wallet")], [("🤝 الديون", "per:debt")],
                      [("📝 المذكرات", "per:note")], [("🎯 الأهداف", "per:goal")],
                      [("🔔 الالتزامات", "per:obl")], [("📊 التقرير الشامل", "per:report")],
-                     [BACK_HOME]))
+                     [("📞 تواصل معنا", "support:home")], [BACK_HOME]))
         return
-    if act == "exp":
-        _exp_menu(ctx)
-    elif act == "exp:cat" and len(a) > 2 and a[2] in EXPENSE_CATS:
-        ctx.go("per:exp_amt", exp_cat=a[2])
-        ctx.reply("اخترت: <b>%s</b>\nأدخل المبلغ:" % EXPENSE_CATS[a[2]],
-                  kb([("❌ إلغاء", "per:exp")]))
-    elif act == "exp:det":
-        ctx.go("per:exp_det")
-        ctx.reply("أدخل تفاصيل/ملاحظات الصرف (أو أرسل . للتخطي):",
-                  kb([("⏭ تخطي", "per:exp:skipdet")], [("❌ إلغاء", "per:exp")]))
-    elif act == "exp:skipdet" and st == "per:exp_det":
-        _save_expense(ctx, None)
-    elif act == "exp:today":
-        _exp_today(ctx)
-    elif act == "exp:month":
-        _exp_month(ctx)
-    elif act == "exp:list":
-        _exp_list(ctx, 0)
-    elif act == "exp:listpage" and len(a) > 1 and a[1].isdigit():
-        _exp_list(ctx, int(a[1]))
-    elif act == "inc":
-        _inc_menu(ctx)
-    elif act == "inc:add":
-        ctx.go("per:inc_src", inc_period=a[1] if len(a) > 1 else "daily")
-        ctx.reply("أدخل مصدر الدخل (مثال: راتب، مبيعات، هدية):",
-                  kb([("❌ إلغاء", "per:inc")]))
-    elif act == "inc:amt" and st == "per:inc_amt":
-        pass
-    elif act == "inc:save":
-        _save_income(ctx)
-    elif act == "inc:today":
-        _inc_today(ctx)
-    elif act == "inc:month":
-        _inc_month(ctx)
-    elif act == "inc:list":
-        _inc_list(ctx)
-    elif act == "wallet":
-        _wallet(ctx)
-    elif act == "debt":
-        _debt_menu(ctx)
-    elif act == "debt:for":
-        ctx.go("per:debt_for_name", debt_dir="for_me")
-        ctx.reply("🤝 <b>دين لي (عند الناس)</b>\nأدخل اسم الشخص:",
-                  kb([("❌ إلغاء", "per:debt")]))
-    elif act == "debt:on":
-        ctx.go("per:debt_on_name", debt_dir="on_me")
-        ctx.reply("🤝 <b>دين عليّ (للناس)</b>\nأدخل اسم الشخص:",
-                  kb([("❌ إلغاء", "per:debt")]))
-    elif act == "debt:list" and len(a) > 1 and a[1] in ("for_me", "on_me"):
-        _debt_list(ctx, a[1])
-    elif act == "debt:view" and len(a) > 1 and a[1].isdigit():
-        _debt_view(ctx, int(a[1]))
-    elif act == "debt:pay" and len(a) > 1 and a[1].isdigit():
-        ctx.go("per:debt_pay", debt_id=int(a[1]))
-        ctx.reply("أدخل المبلغ الذي سيُسدد الآن:", kb([("❌ إلغاء", "per:debt")]))
-    elif act == "debt:wa" and len(a) > 1 and a[1].isdigit():
-        _debt_whatsapp(ctx, int(a[1]))
-    elif act == "debt:del" and len(a) > 1 and a[1].isdigit():
-        _debt_delete(ctx, int(a[1]))
-    elif act == "note":
-        _note_menu(ctx)
-    elif act == "note:add":
-        ctx.go("per:note_title")
-        ctx.reply("📝 أدخل عنوان المذكرة:", kb([("❌ إلغاء", "per:note")]))
-    elif act == "note:content":
-        ctx.go("per:note_content")
-        ctx.reply("اكتب محتوى المذكرة:", kb([("❌ إلغاء", "per:note")]))
-    elif act == "note:list":
-        _note_list(ctx, 0)
-    elif act == "note:listpage" and len(a) > 1 and a[1].isdigit():
-        _note_list(ctx, int(a[1]))
-    elif act == "note:view" and len(a) > 1 and a[1].isdigit():
-        _note_view(ctx, int(a[1]))
-    elif act == "note:del" and len(a) > 1 and a[1].isdigit():
-        _note_delete(ctx, int(a[1]))
-    elif act == "goal":
-        _goal_menu(ctx)
-    elif act == "goal:add":
-        ctx.go("per:goal_name")
-        ctx.reply("🎯 أدخل اسم الهدف (مثال: شراء لابتوب):", kb([("❌ إلغاء", "per:goal")]))
-    elif act == "goal:target":
-        ctx.go("per:goal_target")
-        ctx.reply("أدخل المبلغ المستهدف:", kb([("❌ إلغاء", "per:goal")]))
-    elif act == "goal:list":
-        _goal_list(ctx)
-    elif act == "goal:view" and len(a) > 1 and a[1].isdigit():
-        _goal_view(ctx, int(a[1]))
-    elif act == "goal:dep" and len(a) > 1 and a[1].isdigit():
-        ctx.go("per:goal_dep", goal_id=int(a[1]))
-        ctx.reply("أدخل مبلغ الإيداع في هذا الهدف:", kb([("❌ إلغاء", "per:goal")]))
-    elif act == "goal:del" and len(a) > 1 and a[1].isdigit():
-        _goal_delete(ctx, int(a[1]))
-    elif act == "obl":
-        _obl_menu(ctx)
-    elif act == "obl:add":
-        ctx.go("per:obl_name")
-        ctx.reply("🔔 أدخل اسم الالتزام (إيجار، إنترنت...):", kb([("❌ إلغاء", "per:obl")]))
-    elif act == "obl:amt":
-        ctx.go("per:obl_amt")
-        ctx.reply("أدخل المبلغ الشهري:", kb([("❌ إلغاء", "per:obl")]))
-    elif act == "obl:day":
-        ctx.go("per:obl_day")
-        ctx.reply("أدخل يوم السداد في الشهر (1-31):", kb([("❌ إلغاء", "per:obl")]))
-    elif act == "obl:list":
-        _obl_list(ctx)
-    elif act == "obl:paid" and len(a) > 1 and a[1].isdigit():
-        _obl_pay(ctx, int(a[1]))
-    elif act == "obl:del" and len(a) > 1 and a[1].isdigit():
-        _obl_delete(ctx, int(a[1]))
-    elif act == "report":
-        _report(ctx)
+
+    # ── المصاريف ──
+    if section == "exp":
+        if not action: return _exp_menu(ctx)
+        if action == "cat" and arg in EXPENSE_CATS:
+            ctx.go("per:exp_amt", exp_cat=arg)
+            return ctx.reply("اخترت: <b>%s</b>\nأدخل المبلغ:" % EXPENSE_CATS[arg],
+                             kb([("❌ إلغاء", "per:exp")]))
+        if action == "det":
+            ctx.go("per:exp_det")
+            return ctx.reply("أدخل تفاصيل (أو اضغط تخطي):",
+                             kb([("⏭ تخطي", "per:exp:skipdet")], [("❌ إلغاء", "per:exp")]))
+        if action == "skipdet": return _save_expense(ctx, None)
+        if action == "today": return _exp_today(ctx)
+        if action == "month": return _exp_month(ctx)
+        if action == "list": return _exp_list(ctx, 0)
+        if action == "listpage" and arg.isdigit(): return _exp_list(ctx, int(arg))
+
+    # ── الدخل ──
+    elif section == "inc":
+        if not action: return _inc_menu(ctx)
+        if action == "add":
+            ctx.go("per:inc_src", inc_period=arg or "daily")
+            return ctx.reply("أدخل مصدر الدخل (مثال: راتب، مبيعات):", kb([("❌ إلغاء", "per:inc")]))
+        if action == "save": return _save_income(ctx)
+        if action == "today": return _inc_today(ctx)
+        if action == "month": return _inc_month(ctx)
+        if action == "list": return _inc_list(ctx)
+
+    # ── المحفظة ──
+    elif section == "wallet":
+        return _wallet(ctx)
+
+    # ── الديون ──
+    elif section == "debt":
+        if not action: return _debt_menu(ctx)
+        if action == "for":
+            ctx.go("per:debt_for_name", debt_dir="for_me")
+            return ctx.reply("🤝 <b>دين لي (عند الناس)</b>\nأدخل اسم الشخص:", kb([("❌ إلغاء", "per:debt")]))
+        if action == "on":
+            ctx.go("per:debt_on_name", debt_dir="on_me")
+            return ctx.reply("🤝 <b>دين عليّ (للناس)</b>\nأدخل اسم الشخص:", kb([("❌ إلغاء", "per:debt")]))
+        if action == "skipphone": return _debt_continue(ctx, "")
+        if action == "skipreason": return _save_debt(ctx, None)
+        if action == "list" and arg in ("for_me", "on_me"): return _debt_list(ctx, arg)
+        if action == "view" and arg.isdigit(): return _debt_view(ctx, int(arg))
+        if action == "pay" and arg.isdigit():
+            ctx.go("per:debt_pay", debt_id=int(arg))
+            return ctx.reply("أدخل المبلغ الذي سيُسدد الآن:", kb([("❌ إلغاء", "per:debt")]))
+        if action == "wa" and arg.isdigit(): return _debt_whatsapp(ctx, int(arg))
+        if action == "del" and arg.isdigit(): return _debt_delete(ctx, int(arg))
+
+    # ── المذكرات ──
+    elif section == "note":
+        if not action: return _note_menu(ctx)
+        if action == "add":
+            ctx.go("per:note_title")
+            return ctx.reply("📝 أدخل عنوان المذكرة:", kb([("❌ إلغاء", "per:note")]))
+        if action == "content":
+            ctx.go("per:note_content")
+            return ctx.reply("اكتب محتوى المذكرة:", kb([("❌ إلغاء", "per:note")]))
+        if action == "list": return _note_list(ctx, 0)
+        if action == "listpage" and arg.isdigit(): return _note_list(ctx, int(arg))
+        if action == "view" and arg.isdigit(): return _note_view(ctx, int(arg))
+        if action == "del" and arg.isdigit(): return _note_delete(ctx, int(arg))
+
+    # ── الأهداف ──
+    elif section == "goal":
+        if not action: return _goal_menu(ctx)
+        if action == "add":
+            ctx.go("per:goal_name")
+            return ctx.reply("🎯 أدخل اسم الهدف:", kb([("❌ إلغاء", "per:goal")]))
+        if action == "target":
+            ctx.go("per:goal_target")
+            return ctx.reply("أدخل المبلغ المستهدف:", kb([("❌ إلغاء", "per:goal")]))
+        if action == "list": return _goal_list(ctx)
+        if action == "view" and arg.isdigit(): return _goal_view(ctx, int(arg))
+        if action == "dep" and arg.isdigit():
+            ctx.go("per:goal_dep", goal_id=int(arg))
+            return ctx.reply("أدخل مبلغ الإيداع:", kb([("❌ إلغاء", "per:goal")]))
+        if action == "del" and arg.isdigit(): return _goal_delete(ctx, int(arg))
+
+    # ── الالتزامات ──
+    elif section == "obl":
+        if not action: return _obl_menu(ctx)
+        if action == "add":
+            ctx.go("per:obl_name")
+            return ctx.reply("🔔 أدخل اسم الالتزام:", kb([("❌ إلغاء", "per:obl")]))
+        if action == "amt":
+            ctx.go("per:obl_amt")
+            return ctx.reply("أدخل المبلغ الشهري:", kb([("❌ إلغاء", "per:obl")]))
+        if action == "day":
+            ctx.go("per:obl_day")
+            return ctx.reply("أدخل يوم السداد (1-31):", kb([("❌ إلغاء", "per:obl")]))
+        if action == "list": return _obl_list(ctx)
+        if action == "paid" and arg.isdigit(): return _obl_pay(ctx, int(arg))
+        if action == "del" and arg.isdigit(): return _obl_delete(ctx, int(arg))
+
+    elif section == "report":
+        return _report(ctx)
+
+    return _menu(ctx)
+
+
+def _menu(ctx):
+    ctx.reset()
+    ctx.reply("👤 <b>القسم الفردي</b>\nاختر:",
+              kb([("💸 المصاريف", "per:exp")], [("💰 الدخل", "per:inc")],
+                 [("💼 المحفظة", "per:wallet")], [("🤝 الديون", "per:debt")],
+                 [("📝 المذكرات", "per:note")], [("🎯 الأهداف", "per:goal")],
+                 [("🔔 الالتزامات", "per:obl")], [("📊 التقرير", "per:report")],
+                 [("📞 تواصل معنا", "support:home")], [BACK_HOME]))
 
 
 # ═══════════════════ المصاريف ═══════════════════
 def _exp_menu(ctx):
     ctx.reset()
-    ctx.reply("💸 <b>المصاريف</b>\nاختر التصنيف لإضافة صرف:",
+    ctx.reply("💸 <b>المصاريف</b>\nاختر التصنيف:",
               kb(*[[(v, "per:exp:cat:%s" % k)] for k, v in EXPENSE_CATS.items()],
-                 [("📊 كم صرفت اليوم؟", "per:exp:today"), ("📅 كم صرفت هذا الشهر؟", "per:exp:month")],
+                 [("📊 اليوم", "per:exp:today"), ("📅 الشهر", "per:exp:month")],
                  [("📋 كشف تفصيلي", "per:exp:list")],
                  [("↩️ رجوع", "per:menu"), BACK_HOME]))
 
@@ -2799,53 +2744,40 @@ def _exp_menu(ctx):
 @on_state("per:exp_amt")
 def st_exp_amt(ctx):
     v = parse_float(ctx.text, 0.0)
-    if v is None or v <= 0:
-        ctx.send("أدخل مبلغاً صحيحاً أكبر من صفر:")
-        return
+    if v is None or v <= 0: ctx.send("أدخل مبلغاً أكبر من صفر:"); return
     ctx.go("per:exp_det", exp_amt=v)
-    ctx.reply("أدخل تفاصيل/ملاحظات الصرف (أو اضغط تخطي):",
-              kb([("⏭ تخطي", "per:exp:skipdet")], [("❌ إلغاء", "per:exp")]))
+    ctx.reply("أدخل تفاصيل (أو تخطي):", kb([("⏭ تخطي", "per:exp:skipdet")], [("❌ إلغاء", "per:exp")]))
 
 
 @on_state("per:exp_det")
-def st_exp_det(ctx):
-    det = core.clean_text(ctx.text, 300, True)
-    _save_expense(ctx, det)
+def st_exp_det(ctx): _save_expense(ctx, core.clean_text(ctx.text, 300, True))
 
 
 def _save_expense(ctx, details):
-    d = ctx.data
-    amt = d.get("exp_amt")
-    cat = d.get("exp_cat")
+    d = ctx.data; amt = d.get("exp_amt"); cat = d.get("exp_cat")
     if not amt or not cat:
-        ctx.reset()
-        ctx.send("انتهت صلاحية الشاشة.", kb([("💸 المصاريف", "per:exp"), BACK_HOME]))
-        return
+        ctx.reset(); ctx.send("انتهت الصلاحية.", kb([("💸 المصاريف", "per:exp"), BACK_HOME])); return
     db.run("INSERT INTO personal_expenses (client_num, category, amount, details) "
            "VALUES (:p_cn, :p_cat, :p_amt, :p_det)",
            p_cn=_cn(ctx), p_cat=cat, p_amt=amt, p_det=details)
     core.audit("EXPENSE_ADD", ctx, details="%s %s" % (cat, amt))
     ctx.reset()
-    ctx.reply("✅ تم حفظ الصرف: <b>%s</b> — %s\nالتصنيف: %s\nالوقت: %s"
-              % (fmt_num(amt), _u(ctx), EXPENSE_CATS[cat], "الآن"),
-              kb([("➕ صرف آخر", "per:exp")], [("📊 كم صرفت اليوم؟", "per:exp:today")],
-                 [BACK_HOME]))
+    ctx.reply("✅ تم حفظ الصرف: <b>%s</b> — %s\nالتصنيف: %s" % (fmt_num(amt), _u(ctx), EXPENSE_CATS[cat]),
+              kb([("➕ صرف آخر", "per:exp")], [("📊 اليوم", "per:exp:today")], [BACK_HOME]))
 
 
 def _exp_today(ctx):
     r = db.one("SELECT NVL(SUM(amount), 0) AS total, COUNT(*) AS cnt FROM personal_expenses "
                "WHERE client_num = :p_cn AND " + _today_cond(), p_cn=_cn(ctx))
-    ctx.reply("📊 صرف اليوم: <b>%s</b> %s\nعدد العمليات: %s"
-              % (fmt_num(r["total"]), _u(ctx), r["cnt"]),
-              kb([("📅 هذا الشهر", "per:exp:month"), ("💸 إضافة صرف", "per:exp")], [BACK_HOME]))
+    ctx.reply("📊 صرف اليوم: <b>%s</b> %s\nالعمليات: %s" % (fmt_num(r["total"]), _u(ctx), r["cnt"]),
+              kb([("📅 الشهر", "per:exp:month"), ("💸 صرف", "per:exp")], [BACK_HOME]))
 
 
 def _exp_month(ctx):
     r = db.one("SELECT NVL(SUM(amount), 0) AS total, COUNT(*) AS cnt FROM personal_expenses "
-               "WHERE client_num = :p_cn AND " + _month_start_cond(), p_cn=_cn(ctx))
-    ctx.reply("📅 صرف هذا الشهر: <b>%s</b> %s\nعدد العمليات: %s"
-              % (fmt_num(r["total"]), _u(ctx), r["cnt"]),
-              kb([("📊 اليوم", "per:exp:today"), ("💸 إضافة صرف", "per:exp")], [BACK_HOME]))
+               "WHERE client_num = :p_cn AND " + _month_cond(), p_cn=_cn(ctx))
+    ctx.reply("📅 صرف الشهر: <b>%s</b> %s\nالعمليات: %s" % (fmt_num(r["total"]), _u(ctx), r["cnt"]),
+              kb([("📊 اليوم", "per:exp:today"), ("💸 صرف", "per:exp")], [BACK_HOME]))
 
 
 def _exp_list(ctx, page):
@@ -2857,83 +2789,69 @@ def _exp_list(ctx, page):
         cat = EXPENSE_CATS.get(r["category"], r["category"])
         lines.append("%s • %s %s\n    %s — %s" % (cat, fmt_num(r["amount"]), _u(ctx),
                                                   esc(r.get("details") or "-"), fmt_dt(r["created_at"])))
-    if not rows:
-        lines.append("لا توجد مصاريف مسجلة.")
+    if not rows: lines.append("لا توجد مصاريف.")
     nav = []
-    if page > 0:
-        nav.append(("◀️ السابق", "per:exp:listpage:%d" % (page - 1)))
-    if len(rows) == 15:
-        nav.append(("التالي ▶️", "per:exp:listpage:%d" % (page + 1)))
-    rows_btns = ([nav] if nav else []) + [[("💸 إضافة صرف", "per:exp")], [("↩️ رجوع", "per:menu"), BACK_HOME]]
+    if page > 0: nav.append(("◀️ السابق", "per:exp:listpage:%d" % (page - 1)))
+    if len(rows) == 15: nav.append(("التالي ▶️", "per:exp:listpage:%d" % (page + 1)))
+    rows_btns = ([nav] if nav else []) + [[("💸 صرف", "per:exp")], [("↩️ رجوع", "per:menu"), BACK_HOME]]
     ctx.reply("\n".join(lines), kb(*rows_btns))
 
 
 # ═══════════════════ الدخل ═══════════════════
 def _inc_menu(ctx):
     ctx.reset()
-    ctx.reply("💰 <b>الدخل والميزانية</b>",
-              kb([("➕ إضافة دخل يومي", "per:inc:add:daily")],
-                 [("➕ إضافة دخل شهري", "per:inc:add:monthly")],
-                 [("📊 كم دخل اليوم؟", "per:inc:today"), ("📅 كم دخل الشهر؟", "per:inc:month")],
-                 [("📋 كشف الدخل", "per:inc:list")],
-                 [("💼 محفظتي الصافية", "per:wallet")],
+    ctx.reply("💰 <b>الدخل</b>",
+              kb([("➕ دخل يومي", "per:inc:add:daily")], [("➕ دخل شهري", "per:inc:add:monthly")],
+                 [("📊 اليوم", "per:inc:today"), ("📅 الشهر", "per:inc:month")],
+                 [("📋 كشف", "per:inc:list")], [("💼 المحفظة", "per:wallet")],
                  [("↩️ رجوع", "per:menu"), BACK_HOME]))
 
 
 @on_state("per:inc_src")
 def st_inc_src(ctx):
     v = core.clean_text(ctx.text, 100, True)
-    if not v:
-        ctx.send("أدخل مصدر الدخل:")
-        return
-    ctx.go("per:inc_amt", inc_src=v)
-    ctx.reply("أدخل المبلغ:", kb([("❌ إلغاء", "per:inc")]))
+    if not v: ctx.send("أدخل مصدر الدخل:"); return
+    ctx.go("per:inc_amt", inc_src=v); ctx.reply("أدخل المبلغ:", kb([("❌ إلغاء", "per:inc")]))
 
 
 @on_state("per:inc_amt")
 def st_inc_amt(ctx):
     v = parse_float(ctx.text, 0.0)
-    if v is None or v <= 0:
-        ctx.send("أدخل مبلغاً صحيحاً أكبر من صفر:")
-        return
+    if v is None or v <= 0: ctx.send("أدخل مبلغاً:"); return
     ctx.go("per:inc_notes", inc_amt=v)
-    ctx.reply("أدخل ملاحظات (أو اضغط تخطي):", kb([("⏭ تخطي", "per:inc:save")], [("❌ إلغاء", "per:inc")]))
+    ctx.reply("ملاحظات (أو تخطي):", kb([("⏭ تخطي", "per:inc:save")], [("❌ إلغاء", "per:inc")]))
 
 
 @on_state("per:inc_notes")
 def st_inc_notes(ctx):
-    ctx.put(inc_notes=core.clean_text(ctx.text, 300, True))
-    _save_income(ctx)
+    ctx.put(inc_notes=core.clean_text(ctx.text, 300, True)); _save_income(ctx)
 
 
 def _save_income(ctx):
-    d = ctx.data
-    src, amt, period = d.get("inc_src"), d.get("inc_amt"), d.get("inc_period") or "daily"
+    d = ctx.data; src, amt, period = d.get("inc_src"), d.get("inc_amt"), d.get("inc_period") or "daily"
     if not src or not amt:
-        ctx.reset()
-        ctx.send("انتهت الصلاحية.", kb([("💰 الدخل", "per:inc"), BACK_HOME]))
-        return
+        ctx.reset(); ctx.send("انتهت الصلاحية.", kb([("💰 الدخل", "per:inc"), BACK_HOME])); return
     db.run("INSERT INTO personal_income (client_num, source, amount, period, notes) "
            "VALUES (:p_cn, :p_src, :p_amt, :p_p, :p_n)",
            p_cn=_cn(ctx), p_src=src, p_amt=amt, p_p=period, p_n=d.get("inc_notes"))
     core.audit("INCOME_ADD", ctx, details="%s %s %s" % (src, amt, period))
     ctx.reset()
-    ctx.reply("✅ تم تسجيل الدخل: <b>%s</b> %s\nالمصدر: %s\nالنوع: %s"
+    ctx.reply("✅ الدخل: <b>%s</b> %s\nالمصدر: %s\nالنوع: %s"
               % (fmt_num(amt), _u(ctx), esc(src), "يومي" if period == "daily" else "شهري"),
-              kb([("➕ دخل آخر", "per:inc")], [("💼 المحفظة", "per:wallet")], [BACK_HOME]))
+              kb([("➕ آخر", "per:inc")], [("💼 المحفظة", "per:wallet")], [BACK_HOME]))
 
 
 def _inc_today(ctx):
     r = db.one("SELECT NVL(SUM(amount), 0) AS total FROM personal_income "
                "WHERE client_num = :p_cn AND " + _today_cond(), p_cn=_cn(ctx))
     ctx.reply("📊 دخل اليوم: <b>%s</b> %s" % (fmt_num(r["total"]), _u(ctx)),
-              kb([("📅 هذا الشهر", "per:inc:month")], [BACK_HOME]))
+              kb([("📅 الشهر", "per:inc:month")], [BACK_HOME]))
 
 
 def _inc_month(ctx):
     r = db.one("SELECT NVL(SUM(amount), 0) AS total FROM personal_income "
-               "WHERE client_num = :p_cn AND " + _month_start_cond(), p_cn=_cn(ctx))
-    ctx.reply("📅 دخل هذا الشهر: <b>%s</b> %s" % (fmt_num(r["total"]), _u(ctx)),
+               "WHERE client_num = :p_cn AND " + _month_cond(), p_cn=_cn(ctx))
+    ctx.reply("📅 دخل الشهر: <b>%s</b> %s" % (fmt_num(r["total"]), _u(ctx)),
               kb([("📊 اليوم", "per:inc:today")], [BACK_HOME]))
 
 
@@ -2945,197 +2863,129 @@ def _inc_list(ctx):
         lines.append("%s • %s %s (%s)\n    %s — %s" % (esc(r["source"]), fmt_num(r["amount"]), _u(ctx),
                                                        "يومي" if r["period"] == "daily" else "شهري",
                                                        esc(r.get("notes") or "-"), fmt_dt(r["created_at"])))
-    if not rows:
-        lines.append("لا توجد سجلات دخل.")
-    ctx.reply("\n".join(lines), kb([("➕ إضافة دخل", "per:inc")], [("↩️ رجوع", "per:inc"), BACK_HOME]))
+    if not rows: lines.append("لا سجلات.")
+    ctx.reply("\n".join(lines), kb([("➕ دخل", "per:inc")], [("↩️ رجوع", "per:inc"), BACK_HOME]))
 
 
-# ═══════════════════ المحفظة الصافية ═══════════════════
+# ═══════════════════ المحفظة ═══════════════════
 def _wallet(ctx):
-    cn = _cn(ctx)
-    u = _u(ctx)
+    cn = _cn(ctx); u = _u(ctx)
     today = db.one("SELECT "
                    "(SELECT NVL(SUM(amount),0) FROM personal_income WHERE client_num=:c AND " + _today_cond() + ") AS inc, "
                    "(SELECT NVL(SUM(amount),0) FROM personal_expenses WHERE client_num=:c AND " + _today_cond() + ") AS exp",
                    c=cn)
     month = db.one("SELECT "
-                   "(SELECT NVL(SUM(amount),0) FROM personal_income WHERE client_num=:c AND " + _month_start_cond() + ") AS inc, "
-                   "(SELECT NVL(SUM(amount),0) FROM personal_expenses WHERE client_num=:c AND " + _month_start_cond() + ") AS exp",
+                   "(SELECT NVL(SUM(amount),0) FROM personal_income WHERE client_num=:c AND " + _month_cond() + ") AS inc, "
+                   "(SELECT NVL(SUM(amount),0) FROM personal_expenses WHERE client_num=:c AND " + _month_cond() + ") AS exp",
                    c=cn)
     t_inc, t_exp = float(today["inc"]), float(today["exp"])
     m_inc, m_exp = float(month["inc"]), float(month["exp"])
-    text = ("💼 <b>محفظتي الصافية</b>\n\n"
-            "<b>اليوم:</b>\n"
-            "💰 الدخل: %s %s\n"
-            "💸 المصاريف: %s %s\n"
-            "📊 الصافي: <b>%s</b> %s\n\n"
-            "<b>هذا الشهر:</b>\n"
-            "💰 الدخل: %s %s\n"
-            "💸 المصاريف: %s %s\n"
+    text = ("💼 <b>محفظتي الصافية</b>\n\n<b>اليوم:</b>\n💰 الدخل: %s %s\n💸 المصاريف: %s %s\n"
+            "📊 الصافي: <b>%s</b> %s\n\n<b>هذا الشهر:</b>\n💰 الدخل: %s %s\n💸 المصاريف: %s %s\n"
             "📊 الصافي: <b>%s</b> %s"
             % (fmt_num(t_inc), u, fmt_num(t_exp), u, fmt_num(t_inc - t_exp), u,
                fmt_num(m_inc), u, fmt_num(m_exp), u, fmt_num(m_inc - m_exp), u))
-    ctx.reply(text, kb([("💸 إضافة صرف", "per:exp"), ("💰 إضافة دخل", "per:inc")], [("↩️ رجوع", "per:menu"), BACK_HOME]))
+    ctx.reply(text, kb([("💸 صرف", "per:exp"), ("💰 دخل", "per:inc")], [("↩️ رجوع", "per:menu"), BACK_HOME]))
 
 
 # ═══════════════════ الديون الشخصية ═══════════════════
 def _debt_menu(ctx):
-    cn = _cn(ctx)
-    u = _u(ctx)
+    cn = _cn(ctx); u = _u(ctx)
     for_me = db.one("SELECT NVL(SUM(amount - paid_amount), 0) AS t, COUNT(*) AS c FROM personal_debts "
                     "WHERE client_num = :c AND direction = 'for_me'", c=cn)
     on_me = db.one("SELECT NVL(SUM(amount - paid_amount), 0) AS t, COUNT(*) AS c FROM personal_debts "
                    "WHERE client_num = :c AND direction = 'on_me'", c=cn)
     ctx.reset()
-    ctx.reply("🤝 <b>الديون الشخصية</b>\n\n"
-              "💚 ديون لي (عند الناس): <b>%s</b> %s (%s شخص)\n"
-              "🔴 ديون عليّ (للناس): <b>%s</b> %s (%s شخص)"
+    ctx.reply("🤝 <b>الديون الشخصية</b>\n\n💚 ديون لي: <b>%s</b> %s (%s)\n🔴 ديون عليّ: <b>%s</b> %s (%s)"
               % (fmt_num(for_me["t"]), u, for_me["c"], fmt_num(on_me["t"]), u, on_me["c"]),
-              kb([("➕ دين لي (عند الناس)", "per:debt:for")],
-                 [("➕ دين عليّ (للناس)", "per:debt:on")],
-                 [("📋 كشف ديون لي", "per:debt:list:for_me"), ("📋 كشف ديون عليّ", "per:debt:list:on_me")],
+              kb([("➕ دين لي", "per:debt:for")], [("➕ دين عليّ", "per:debt:on")],
+                 [("📋 كشف لي", "per:debt:list:for_me"), ("📋 كشف عليّ", "per:debt:list:on_me")],
                  [("↩️ رجوع", "per:menu"), BACK_HOME]))
 
 
 @on_state("per:debt_for_name")
 def st_debt_for_name(ctx):
     v = core.clean_text(ctx.text, 100, True)
-    if not v:
-        ctx.send("أدخل اسم الشخص:")
-        return
+    if not v: ctx.send("أدخل اسم الشخص:"); return
     ctx.go("per:debt_for_phone", debt_name=v)
-    ctx.reply("أدخل رقم هاتف الشخص (اختياري):", kb([("⏭ تخطي", "per:debt:skipphone")], [("❌ إلغاء", "per:debt")]))
+    ctx.reply("أدخل رقم الهاتف (اختياري):", kb([("⏭ تخطي", "per:debt:skipphone")], [("❌ إلغاء", "per:debt")]))
 
 
 @on_state("per:debt_on_name")
 def st_debt_on_name(ctx):
     v = core.clean_text(ctx.text, 100, True)
-    if not v:
-        ctx.send("أدخل اسم الشخص:")
-        return
+    if not v: ctx.send("أدخل اسم الشخص:"); return
     ctx.go("per:debt_on_phone", debt_name=v)
-    ctx.reply("أدخل رقم هاتف الشخص (اختياري):", kb([("⏭ تخطي", "per:debt:skipphone")], [("❌ إلغاء", "per:debt")]))
-
-
-@on_cb("per")
-def _noop(ctx):  # placeholder
-    pass
+    ctx.reply("أدخل رقم الهاتف (اختياري):", kb([("⏭ تخطي", "per:debt:skipphone")], [("❌ إلغاء", "per:debt")]))
 
 
 def _debt_continue(ctx, phone):
-    d = ctx.data
-    dname = d.get("debt_name") or ""
-    direction = d.get("debt_dir") or "for_me"
-    # البحث عن سجل مطابق للدمج
-    ex = db.one("SELECT pdebt_id, amount, paid_amount FROM personal_debts "
-                "WHERE client_num = :c AND direction = :dir AND person_name = :n AND person_phone = :p",
+    d = ctx.data; dname = d.get("debt_name") or ""; direction = d.get("debt_dir") or "for_me"
+    ex = db.one("SELECT pdebt_id FROM personal_debts WHERE client_num = :c AND direction = :dir "
+                "AND person_name = :n AND person_phone = :p",
                 c=_cn(ctx), dir=direction, n=dname, p=phone)
     ctx.put(debt_phone=phone, debt_existing=ex["pdebt_id"] if ex else None)
     ctx.go("per:debt_amount")
-    note = ""
-    if ex:
-        note = "\nℹ️ يوجد سجل سابق لهذا الشخص. سيتم دمج المبلغ الجديد تلقائياً مع دينه السابق."
+    note = "\nℹ️ يوجد سجل سابق، سيتم الدمج." if ex else ""
     ctx.reply("أدخل المبلغ:" + note, kb([("❌ إلغاء", "per:debt")]))
 
 
 @on_state("per:debt_for_phone")
-def st_debt_for_phone(ctx):
-    v = core.clean_text(ctx.text, 30)
-    _debt_continue(ctx, v or "")
-
+def st_debt_for_phone(ctx): _debt_continue(ctx, core.clean_text(ctx.text, 30) or "")
 
 @on_state("per:debt_on_phone")
-def st_debt_on_phone(ctx):
-    v = core.clean_text(ctx.text, 30)
-    _debt_continue(ctx, v or "")
+def st_debt_on_phone(ctx): _debt_continue(ctx, core.clean_text(ctx.text, 30) or "")
 
 
 @on_state("per:debt_amount")
 def st_debt_amount(ctx):
     v = parse_float(ctx.text, 0.0)
-    if v is None or v <= 0:
-        ctx.send("أدخل مبلغاً صحيحاً أكبر من صفر:")
-        return
+    if v is None or v <= 0: ctx.send("أدخل مبلغاً:"); return
     ctx.go("per:debt_reason", debt_amt=v)
-    ctx.reply("أدخل سبب الدين (اختياري):",
-              kb([("⏭ تخطي", "per:debt:skipreason")], [("❌ إلغاء", "per:debt")]))
+    ctx.reply("أدخل سبب الدين (اختياري):", kb([("⏭ تخطي", "per:debt:skipreason")], [("❌ إلغاء", "per:debt")]))
 
 
 @on_state("per:debt_reason")
-def st_debt_reason(ctx):
-    reason = core.clean_text(ctx.text, 300, True)
-    _save_debt(ctx, reason)
+def st_debt_reason(ctx): _save_debt(ctx, core.clean_text(ctx.text, 300, True))
 
 
 def _save_debt(ctx, reason):
-    d = ctx.data
-    direction = d.get("debt_dir") or "for_me"
-    name = d.get("debt_name") or ""
-    phone = d.get("debt_phone") or ""
-    amt = d.get("debt_amt")
+    d = ctx.data; direction = d.get("debt_dir") or "for_me"; name = d.get("debt_name") or ""
+    phone = d.get("debt_phone") or ""; amt = d.get("debt_amt")
     if not name or not amt:
-        ctx.reset()
-        ctx.send("انتهت الجلسة.", kb([("🤝 الديون", "per:debt"), BACK_HOME]))
-        return
+        ctx.reset(); ctx.send("انتهت.", kb([("🤝 الديون", "per:debt"), BACK_HOME])); return
     existing = d.get("debt_existing")
     with db.tx() as t:
         if existing:
             t.run("UPDATE personal_debts SET amount = amount + :p_a, reason = :p_r, "
-                  "last_update = SYSDATE WHERE pdebt_id = :p_id",
-                  p_a=amt, p_r=reason, p_id=existing)
-            msg = "✅ تم <b>الدمج التلقائي</b>! المبلغ الجديد أضيف على الدين السابق لـ <b>%s</b>." % esc(name)
+                  "last_update = SYSDATE WHERE pdebt_id = :p_id", p_a=amt, p_r=reason, p_id=existing)
+            msg = "✅ تم الدمج التلقائي مع دين <b>%s</b>." % esc(name)
         else:
             t.run("INSERT INTO personal_debts (client_num, direction, person_name, person_phone, amount, reason) "
                   "VALUES (:p_cn, :p_dir, :p_n, :p_p, :p_a, :p_r)",
                   p_cn=_cn(ctx), p_dir=direction, p_n=name, p_p=phone, p_a=amt, p_r=reason)
-            msg = "✅ تم تسجيل دين %s <b>%s</b> %s" % ("لـ" if direction == "for_me" else "على", esc(name), fmt_num(amt))
+            msg = "✅ دين %s <b>%s</b> %s" % ("لـ" if direction == "for_me" else "على", esc(name), fmt_num(amt))
         core.audit("PDEBT_ADD", ctx, details="%s %s %s" % (direction, name, amt), t=t)
     ctx.reset()
     ctx.reply(msg + "\nالمبلغ: %s %s" % (fmt_num(amt), _u(ctx)),
-              kb([("➕ دين آخر", "per:debt")], [("📋 كشف الديون", "per:debt:list:%s" % direction)],
-                 [("↩️ رجوع", "per:debt")]))
-
-
-# ── تخطي رقم/سبب الدين عبر أزرار ──
-@on_cb("per")
-def _skip_handlers(ctx):
-    pass  # سنستخدمها لاحقاً
-
-
-# (تعريف skip في on_cb منفصل)
-def _install_skip_handlers():
-    pass
-
-
-@on_state("per:debt_phone_skip")
-def st_debt_phone_skip(ctx):
-    _debt_continue(ctx, "")
-
-
-@on_state("per:debt_reason_skip")
-def st_debt_reason_skip(ctx):
-    _save_debt(ctx, None)
+              kb([("➕ دين آخر", "per:debt")], [("📋 كشف", "per:debt:list:%s" % direction)], [("↩️ رجوع", "per:debt")]))
 
 
 def _debt_list(ctx, direction):
-    cn = _cn(ctx)
-    u = _u(ctx)
+    cn = _cn(ctx); u = _u(ctx)
     rows = db.rows("SELECT pdebt_id, person_name, person_phone, amount, paid_amount, "
                    "(amount - paid_amount) AS remain, reason, created_at "
                    "FROM personal_debts WHERE client_num = :c AND direction = :d "
                    "ORDER BY (amount - paid_amount) DESC", c=cn, d=direction)
-    header = "💚 <b>ديون لي (عند الناس)</b>" if direction == "for_me" else "🔴 <b>ديون عليّ (للناس)</b>"
+    header = "💚 <b>ديون لي</b>" if direction == "for_me" else "🔴 <b>ديون عليّ</b>"
     if not rows:
-        ctx.reply(header + "\n\nلا توجد سجلات.", kb([("↩️ رجوع", "per:debt"), BACK_HOME]))
-        return
+        ctx.reply(header + "\n\nلا سجلات.", kb([("↩️ رجوع", "per:debt"), BACK_HOME])); return
     total = sum(float(r["remain"]) for r in rows)
-    lines = [header, ""]
-    btns = []
+    lines = [header, ""]; btns = []
     for r in rows:
-        lines.append("<b>%s</b> — متبقي: %s %s\n    (أصل: %s | مسدد: %s) | %s"
+        lines.append("<b>%s</b> — متبقي: %s %s\n    (أصل: %s | مسدد: %s)"
                      % (esc(r["person_name"]), fmt_num(r["remain"]), u,
-                        fmt_num(r["amount"]), fmt_num(r["paid_amount"]),
-                        esc(r.get("reason") or "-")))
+                        fmt_num(r["amount"]), fmt_num(r["paid_amount"])))
         btns.append([("👤 %s" % (r["person_name"][:20]), "per:debt:view:%d" % r["pdebt_id"])])
     lines.append("\n💵 الإجمالي: <b>%s</b> %s" % (fmt_num(total), u))
     btns.append([("↩️ رجوع", "per:debt"), BACK_HOME])
@@ -3143,356 +2993,275 @@ def _debt_list(ctx, direction):
 
 
 def _debt_view(ctx, did):
-    r = db.one("SELECT * FROM personal_debts WHERE pdebt_id = :id AND client_num = :c",
-               id=did, c=_cn(ctx))
+    r = db.one("SELECT * FROM personal_debts WHERE pdebt_id = :id AND client_num = :c", id=did, c=_cn(ctx))
     if not r:
-        ctx.reply("⚠️ السجل غير موجود.", kb([("↩️ رجوع", "per:debt")]))
-        return
-    u = _u(ctx)
-    direction = r["direction"]
-    dir_label = "دين لي" if direction == "for_me" else "دين عليّ"
-    text = ("%s\n\n<b>%s</b>\n📞 %s\n💰 أصل المبلغ: %s %s\n✅ المسدد: %s %s\n"
-            "📊 المتبقي: <b>%s</b> %s\n📝 السبب: %s\n📅 التاريخ: %s"
+        ctx.reply("⚠️ غير موجود.", kb([("↩️ رجوع", "per:debt")])); return
+    u = _u(ctx); direction = r["direction"]
+    text = ("%s\n<b>%s</b>\n📞 %s\n💰 أصل: %s %s\n✅ مسدد: %s %s\n📊 متبقي: <b>%s</b> %s\n"
+            "📝 السبب: %s\n📅 %s"
             % ("💚" if direction == "for_me" else "🔴", esc(r["person_name"]), esc(r["person_phone"] or "-"),
                fmt_num(r["amount"]), u, fmt_num(r["paid_amount"]), u,
                fmt_num(float(r["amount"]) - float(r["paid_amount"])), u,
                esc(r.get("reason") or "-"), fmt_dt(r["created_at"])))
-    btns = [
-        [("💸 تسديد دفعة", "per:debt:pay:%d" % did)],
-        [("📤 إرسال كشف عبر واتساب", "per:debt:wa:%d" % did)],
-        [("🗑 حذف السجل", "per:debt:del:%d" % did)],
-        [("↩️ رجوع", "per:debt"), BACK_HOME],
-    ]
-    ctx.reply(text, kb(*btns))
+    ctx.reply(text, kb([("💸 دفعة", "per:debt:pay:%d" % did)],
+                       [("📤 واتساب", "per:debt:wa:%d" % did)],
+                       [("🗑 حذف", "per:debt:del:%d" % did)],
+                       [("↩️ رجوع", "per:debt"), BACK_HOME]))
 
 
 @on_state("per:debt_pay")
 def st_debt_pay(ctx):
     v = parse_float(ctx.text, 0.0)
-    if v is None or v <= 0:
-        ctx.send("أدخل مبلغاً أكبر من صفر:")
-        return
+    if v is None or v <= 0: ctx.send("أدخل مبلغاً:"); return
     did = ctx.data.get("debt_id")
-    r = db.one("SELECT * FROM personal_debts WHERE pdebt_id = :id AND client_num = :c",
-               id=did, c=_cn(ctx))
+    r = db.one("SELECT * FROM personal_debts WHERE pdebt_id = :id AND client_num = :c", id=did, c=_cn(ctx))
     if not r:
-        ctx.reset()
-        ctx.send("⚠️ السجل غير موجود.", kb([("🤝 الديون", "per:debt")]))
-        return
-    remain = float(r["amount"]) - float(r["paid_amount"])
-    pay = min(v, remain)
+        ctx.reset(); ctx.send("⚠️ غير موجود.", kb([("🤝 الديون", "per:debt")])); return
+    remain = float(r["amount"]) - float(r["paid_amount"]); pay = min(v, remain)
     with db.tx() as t:
         t.run("UPDATE personal_debts SET paid_amount = paid_amount + :p_a, last_update = SYSDATE "
               "WHERE pdebt_id = :id", p_a=pay, id=did)
         t.run("INSERT INTO personal_debt_payments (pdebt_id, client_num, amount, note) "
               "VALUES (:id, :c, :a, :n)", id=did, c=_cn(ctx), a=pay, n="دفعة")
-        if v > remain:
-            t.run("UPDATE personal_debts SET paid_amount = amount WHERE pdebt_id = :id", id=did)
+        if v > remain: t.run("UPDATE personal_debts SET paid_amount = amount WHERE pdebt_id = :id", id=did)
         core.audit("PDEBT_PAY", ctx, details="id=%s amount=%s" % (did, pay), t=t)
     ctx.reset()
     extra = " (الزيادة تُرجع)" if v > remain else ""
-    ctx.reply("✅ تم تسجيل الدفعة: <b>%s</b> %s%s\nالمتبقي: <b>%s</b> %s"
+    ctx.reply("✅ الدفعة: <b>%s</b> %s%s\nالمتبقي: <b>%s</b> %s"
               % (fmt_num(pay), _u(ctx), extra, fmt_num(max(remain - pay, 0)), _u(ctx)),
-              kb([("👤 عرض السجل", "per:debt:view:%d" % did)], [("↩️ رجوع", "per:debt")]))
+              kb([("👤 عرض", "per:debt:view:%d" % did)], [("↩️ رجوع", "per:debt")]))
 
 
 def _debt_whatsapp(ctx, did):
-    r = db.one("SELECT * FROM personal_debts WHERE pdebt_id = :id AND client_num = :c",
-               id=did, c=_cn(ctx))
+    r = db.one("SELECT * FROM personal_debts WHERE pdebt_id = :id AND client_num = :c", id=did, c=_cn(ctx))
     if not r:
-        ctx.reply("⚠️ السجل غير موجود.", kb([("↩️ رجوع", "per:debt")]))
-        return
-    u = _u(ctx)
-    remain = float(r["amount"]) - float(r["paid_amount"])
-    direction = r["direction"]
-    if direction == "for_me":
-        msg = ("مرحباً %s،\nتذكير ودّي بخصوص المبلغ المسجل عليك:\n"
-               "المبلغ المتبقي: %s %s\n"
-               "شكراً لك 🌹" % (r["person_name"], fmt_num(remain), u))
+        ctx.reply("⚠️ غير موجود.", kb([("↩️ رجوع", "per:debt")])); return
+    u = _u(ctx); remain = float(r["amount"]) - float(r["paid_amount"])
+    if r["direction"] == "for_me":
+        msg = "مرحباً %s،\nتذكير: المبلغ المتبقي %s %s\nشكراً 🌹" % (r["person_name"], fmt_num(remain), u)
     else:
-        msg = ("مرحباً %s،\nكشف حساب المبلغ الذي عليّ:\n"
-               "أصل الدين: %s %s\n"
-               "المسدد: %s %s\n"
-               "المتبقي: %s %s\n"
-               "شكراً 🌹" % (r["person_name"], fmt_num(r["amount"]), u,
-                              fmt_num(r["paid_amount"]), u, fmt_num(remain), u))
+        msg = "مرحباً %s،\nكشف حسابي:\nأصل: %s %s\nمسدد: %s %s\nمتبقي: %s %s\nشكراً 🌹" % (
+            r["person_name"], fmt_num(r["amount"]), u, fmt_num(r["paid_amount"]), u, fmt_num(remain), u)
     phone = (r["person_phone"] or "").strip()
     if not phone:
-        ctx.reply("⚠️ لا يوجد رقم هاتف مسجل لهذا الشخص.", kb([("↩️ رجوع", "per:debt:view:%d" % did)]))
-        return
-    # تطبيع الرقم: لو يبدأ بـ 7 وطوله 9 نضيف 967 (اليمن)
+        ctx.reply("⚠️ لا يوجد رقم.", kb([("↩️ رجوع", "per:debt:view:%d" % did)])); return
     digits = "".join(ch for ch in phone if ch.isdigit())
-    if digits.startswith("7") and len(digits) == 9:
-        digits = "967" + digits
-    elif not digits.startswith(("1", "2", "3", "4", "5", "6", "7", "8", "9")):
-        digits = "967" + digits
+    if digits.startswith("7") and len(digits) == 9: digits = "967" + digits
+    elif not digits.startswith(("1", "2", "3", "4", "5", "6", "7", "8", "9")): digits = "967" + digits
     url = "https://wa.me/%s?text=%s" % (digits, quote(msg))
     core.audit("PDEBT_WA", ctx, details="id=%s" % did)
-    ctx.reply("📤 رابط إرسال الواتساب:\n<a href='%s'>اضغط لفتح واتساب</a>\n\n<i>الرسالة:</i>\n<code>%s</code>"
-              % (url, esc(msg)),
-              kb([("↩️ رجوع", "per:debt:view:%d" % did)]))
+    ctx.reply("📤 رابط واتساب:\n<a href='%s'>اضغط للفتح</a>\n\n<i>الرسالة:</i>\n<code>%s</code>"
+              % (url, esc(msg)), kb([("↩️ رجوع", "per:debt:view:%d" % did)]))
 
 
 def _debt_delete(ctx, did):
-    n = db.run("DELETE FROM personal_debts WHERE pdebt_id = :id AND client_num = :c",
-               id=did, c=_cn(ctx))
-    db.run("DELETE FROM personal_debt_payments WHERE pdebt_id = :id AND client_num = :c",
-           id=did, c=_cn(ctx))
+    n = db.run("DELETE FROM personal_debts WHERE pdebt_id = :id AND client_num = :c", id=did, c=_cn(ctx))
+    db.run("DELETE FROM personal_debt_payments WHERE pdebt_id = :id AND client_num = :c", id=did, c=_cn(ctx))
     core.audit("PDEBT_DEL", ctx, details="id=%s" % did)
-    ctx.reply("✅ تم حذف السجل." if n else "⚠️ لم يتم العثور على السجل.",
-              kb([("🤝 الديون", "per:debt"), BACK_HOME]))
+    ctx.reply("✅ تم الحذف." if n else "⚠️ غير موجود.", kb([("🤝 الديون", "per:debt"), BACK_HOME]))
 
 
 # ═══════════════════ المذكرات ═══════════════════
 def _note_menu(ctx):
     ctx.reset()
-    ctx.reply("📝 <b>المذكرات والمفكرة</b>",
-              kb([("➕ إضافة مذكرة", "per:note:add")],
-                 [("📋 عرض المذكرات", "per:note:list")],
-                 [("↩️ رجوع", "per:menu"), BACK_HOME]))
+    ctx.reply("📝 <b>المذكرات</b>", kb([("➕ إضافة", "per:note:add")], [("📋 عرض", "per:note:list")],
+                                      [("↩️ رجوع", "per:menu"), BACK_HOME]))
 
 
 @on_state("per:note_title")
 def st_note_title(ctx):
     v = core.clean_text(ctx.text, 200, True)
-    if not v:
-        ctx.send("أدخل عنوان المذكرة:")
-        return
-    ctx.go("per:note_content", note_title=v)
-    ctx.reply("اكتب محتوى المذكرة:", kb([("❌ إلغاء", "per:note")]))
+    if not v: ctx.send("أدخل العنوان:"); return
+    ctx.go("per:note_content", note_title=v); ctx.reply("اكتب المحتوى:", kb([("❌ إلغاء", "per:note")]))
 
 
 @on_state("per:note_content")
 def st_note_content(ctx):
-    content = (ctx.text or "").strip()[:2000]
-    title = ctx.data.get("note_title")
+    content = (ctx.text or "").strip()[:2000]; title = ctx.data.get("note_title")
     if not title:
-        ctx.reset()
-        ctx.send("انتهت الصلاحية.", kb([("📝 المذكرات", "per:note")]))
-        return
+        ctx.reset(); ctx.send("انتهت.", kb([("📝 المذكرات", "per:note")])); return
     db.run("INSERT INTO personal_notes (client_num, title, content) VALUES (:c, :t, :ct)",
            c=_cn(ctx), t=title, ct=content)
     core.audit("NOTE_ADD", ctx, details=title)
     ctx.reset()
     ctx.reply("✅ تم حفظ المذكرة: <b>%s</b>" % esc(title),
-              kb([("📋 عرض المذكرات", "per:note:list")], [("➕ مذكرة أخرى", "per:note:add")], [BACK_HOME]))
+              kb([("📋 عرض", "per:note:list")], [("➕ أخرى", "per:note:add")], [BACK_HOME]))
 
 
 def _note_list(ctx, page):
     rows = db.rows("SELECT note_id, title, created_at FROM personal_notes "
-                   "WHERE client_num = :c ORDER BY note_id DESC LIMIT 10 OFFSET :o",
-                   c=_cn(ctx), o=page * 10)
+                   "WHERE client_num = :c ORDER BY note_id DESC LIMIT 10 OFFSET :o", c=_cn(ctx), o=page * 10)
     if not rows:
-        ctx.reply("📝 لا توجد مذكرات مسجلة.", kb([("➕ إضافة مذكرة", "per:note:add")], [("↩️ رجوع", "per:note")]))
-        return
-    lines = ["📝 <b>مذكراتي</b>", ""]
-    btns = []
+        ctx.reply("📝 لا مذكرات.", kb([("➕ إضافة", "per:note:add")], [("↩️ رجوع", "per:note")])); return
+    lines = ["📝 <b>مذكراتي</b>", ""]; btns = []
     for r in rows:
         lines.append("• <b>%s</b> — %s" % (esc(r["title"]), fmt_dt(r["created_at"])))
         btns.append([(r["title"][:30], "per:note:view:%d" % r["note_id"])])
     nav = []
-    if page > 0:
-        nav.append(("◀️ السابق", "per:note:listpage:%d" % (page - 1)))
-    if len(rows) == 10:
-        nav.append(("التالي ▶️", "per:note:listpage:%d" % (page + 1)))
-    if nav:
-        btns.append(nav)
-    btns.append([("➕ مذكرة جديدة", "per:note:add")])
-    btns.append([("↩️ رجوع", "per:note"), BACK_HOME])
+    if page > 0: nav.append(("◀️ السابق", "per:note:listpage:%d" % (page - 1)))
+    if len(rows) == 10: nav.append(("التالي ▶️", "per:note:listpage:%d" % (page + 1)))
+    if nav: btns.append(nav)
+    btns.append([("➕ مذكرة", "per:note:add")]); btns.append([("↩️ رجوع", "per:note"), BACK_HOME])
     ctx.reply("\n".join(lines), kb(*btns))
 
 
 def _note_view(ctx, nid):
-    r = db.one("SELECT * FROM personal_notes WHERE note_id = :id AND client_num = :c",
-               id=nid, c=_cn(ctx))
+    r = db.one("SELECT * FROM personal_notes WHERE note_id = :id AND client_num = :c", id=nid, c=_cn(ctx))
     if not r:
-        ctx.reply("⚠️ المذكرة غير موجودة.", kb([("↩️ رجوع", "per:note")]))
-        return
+        ctx.reply("⚠️ غير موجود.", kb([("↩️ رجوع", "per:note")])); return
     ctx.reply("📝 <b>%s</b>\n\n%s\n\n🕐 %s" % (esc(r["title"]), esc(r["content"] or ""), fmt_dt(r["created_at"])),
               kb([("🗑 حذف", "per:note:del:%d" % nid)], [("↩️ رجوع", "per:note")]))
 
 
 def _note_delete(ctx, nid):
     db.run("DELETE FROM personal_notes WHERE note_id = :id AND client_num = :c", id=nid, c=_cn(ctx))
-    ctx.reply("✅ تم حذف المذكرة.", kb([("📝 المذكرات", "per:note"), BACK_HOME]))
+    ctx.reply("✅ تم الحذف.", kb([("📝 المذكرات", "per:note"), BACK_HOME]))
 
 
 # ═══════════════════ الأهداف ═══════════════════
 def _goal_menu(ctx):
     ctx.reset()
-    ctx.reply("🎯 <b>حصالة الأهداف والادخار</b>",
-              kb([("➕ إضافة هدف جديد", "per:goal:add")],
-                 [("📊 متابعة الأهداف", "per:goal:list")],
-                 [("↩️ رجوع", "per:menu"), BACK_HOME]))
+    ctx.reply("🎯 <b>الأهداف</b>", kb([("➕ إضافة", "per:goal:add")], [("📊 متابعة", "per:goal:list")],
+                                      [("↩️ رجوع", "per:menu"), BACK_HOME]))
 
 
 @on_state("per:goal_name")
 def st_goal_name(ctx):
     v = core.clean_text(ctx.text, 100, True)
-    if not v:
-        ctx.send("أدخل اسم الهدف:")
-        return
-    ctx.go("per:goal_target", goal_name=v)
-    ctx.reply("أدخل المبلغ المستهدف:", kb([("❌ إلغاء", "per:goal")]))
+    if not v: ctx.send("أدخل اسم الهدف:"); return
+    ctx.go("per:goal_target", goal_name=v); ctx.reply("أدخل المبلغ المستهدف:", kb([("❌ إلغاء", "per:goal")]))
 
 
 @on_state("per:goal_target")
 def st_goal_target(ctx):
     v = parse_float(ctx.text, 0.0)
-    if v is None or v <= 0:
-        ctx.send("أدخل مبلغاً صحيحاً أكبر من صفر:")
-        return
+    if v is None or v <= 0: ctx.send("أدخل مبلغاً:"); return
     db.run("INSERT INTO personal_goals (client_num, name, target_amount) VALUES (:c, :n, :t)",
            c=_cn(ctx), n=ctx.data.get("goal_name"), t=v)
     ctx.reset()
-    ctx.reply("✅ تم حفظ الهدف: <b>%s</b>\nالمبلغ المستهدف: %s %s"
+    ctx.reply("✅ الهدف: <b>%s</b>\nالمستهدف: %s %s"
               % (esc(ctx.data.get("goal_name", "")), fmt_num(v), _u(ctx)),
-              kb([("📊 متابعة الأهداف", "per:goal:list")], [("➕ هدف جديد", "per:goal:add")], [BACK_HOME]))
+              kb([("📊 متابعة", "per:goal:list")], [("➕ هدف", "per:goal:add")], [BACK_HOME]))
 
 
 def _goal_list(ctx):
     rows = db.rows("SELECT * FROM personal_goals WHERE client_num = :c ORDER BY goal_id DESC", c=_cn(ctx))
     if not rows:
-        ctx.reply("🎯 لا توجد أهداف مسجلة.", kb([("➕ إضافة هدف", "per:goal:add")], [("↩️ رجوع", "per:goal")]))
-        return
-    lines = ["🎯 <b>أهدافي</b>", ""]
-    btns = []
+        ctx.reply("🎯 لا أهداف.", kb([("➕ إضافة", "per:goal:add")], [("↩️ رجوع", "per:goal")])); return
+    lines = ["🎯 <b>أهدافي</b>", ""]; btns = []
     for r in rows:
         pct = (float(r["saved_amount"]) / float(r["target_amount"]) * 100) if r["target_amount"] else 0
         lines.append("<b>%s</b>\n    جمعت: %s / %s %s (%.1f%%)"
-                     % (esc(r["name"]), fmt_num(r["saved_amount"]), fmt_num(r["target_amount"]),
-                        _u(ctx), pct))
+                     % (esc(r["name"]), fmt_num(r["saved_amount"]), fmt_num(r["target_amount"]), _u(ctx), pct))
         btns.append([(r["name"][:28], "per:goal:view:%d" % r["goal_id"])])
-    btns.append([("➕ هدف جديد", "per:goal:add")])
-    btns.append([("↩️ رجوع", "per:goal"), BACK_HOME])
+    btns.append([("➕ هدف", "per:goal:add")]); btns.append([("↩️ رجوع", "per:goal"), BACK_HOME])
     ctx.reply("\n".join(lines), kb(*btns))
 
 
 def _goal_view(ctx, gid):
-    r = db.one("SELECT * FROM personal_goals WHERE goal_id = :id AND client_num = :c",
-               id=gid, c=_cn(ctx))
+    r = db.one("SELECT * FROM personal_goals WHERE goal_id = :id AND client_num = :c", id=gid, c=_cn(ctx))
     if not r:
-        ctx.reply("⚠️ الهدف غير موجود.", kb([("↩️ رجوع", "per:goal")]))
-        return
+        ctx.reply("⚠️ غير موجود.", kb([("↩️ رجوع", "per:goal")])); return
     remain = float(r["target_amount"]) - float(r["saved_amount"])
     pct = (float(r["saved_amount"]) / float(r["target_amount"]) * 100) if r["target_amount"] else 0
-    text = ("🎯 <b>%s</b>\n\nالمستهدف: %s %s\nجمعت: <b>%s</b> %s (%.1f%%)\n"
-            "المتبقي: %s %s" % (esc(r["name"]), fmt_num(r["target_amount"]), _u(ctx),
-                               fmt_num(r["saved_amount"]), _u(ctx), pct,
-                               fmt_num(max(remain, 0)), _u(ctx)))
-    ctx.reply(text, kb([("💰 إيداع في الهدف", "per:goal:dep:%d" % gid)],
-                       [("🗑 حذف الهدف", "per:goal:del:%d" % gid)],
-                       [("↩️ رجوع", "per:goal"), BACK_HOME]))
+    ctx.reply("🎯 <b>%s</b>\n\nالمستهدف: %s %s\nجمعت: <b>%s</b> %s (%.1f%%)\nالمتبقي: %s %s"
+              % (esc(r["name"]), fmt_num(r["target_amount"]), _u(ctx), fmt_num(r["saved_amount"]), _u(ctx),
+                 pct, fmt_num(max(remain, 0)), _u(ctx)),
+              kb([("💰 إيداع", "per:goal:dep:%d" % gid)], [("🗑 حذف", "per:goal:del:%d" % gid)],
+                 [("↩️ رجوع", "per:goal"), BACK_HOME]))
 
 
 @on_state("per:goal_dep")
 def st_goal_dep(ctx):
     v = parse_float(ctx.text, 0.0)
-    if v is None or v <= 0:
-        ctx.send("أدخل مبلغاً أكبر من صفر:")
-        return
+    if v is None or v <= 0: ctx.send("أدخل مبلغاً:"); return
     gid = ctx.data.get("goal_id")
     db.run("UPDATE personal_goals SET saved_amount = saved_amount + :a WHERE goal_id = :id AND client_num = :c",
            a=v, id=gid, c=_cn(ctx))
-    ctx.reply("✅ تم إيداع %s %s في الهدف." % (fmt_num(v), _u(ctx)),
-              kb([("👀 عرض الهدف", "per:goal:view:%d" % gid)], [("↩️ رجوع", "per:goal")]))
+    ctx.reply("✅ تم إيداع %s %s." % (fmt_num(v), _u(ctx)),
+              kb([("👀 عرض", "per:goal:view:%d" % gid)], [("↩️ رجوع", "per:goal")]))
     ctx.reset()
 
 
 def _goal_delete(ctx, gid):
     db.run("DELETE FROM personal_goals WHERE goal_id = :id AND client_num = :c", id=gid, c=_cn(ctx))
-    ctx.reply("✅ تم حذف الهدف.", kb([("🎯 الأهداف", "per:goal"), BACK_HOME]))
+    ctx.reply("✅ تم الحذف.", kb([("🎯 الأهداف", "per:goal"), BACK_HOME]))
 
 
-# ═══════════════════ الالتزامات الشهرية ═══════════════════
+# ═══════════════════ الالتزامات ═══════════════════
 def _obl_menu(ctx):
     ctx.reset()
-    ctx.reply("🔔 <b>الالتزامات الشهرية</b>",
-              kb([("➕ إضافة التزام", "per:obl:add")],
-                 [("📊 حالة الالتزامات", "per:obl:list")],
-                 [("↩️ رجوع", "per:menu"), BACK_HOME]))
+    ctx.reply("🔔 <b>الالتزامات</b>", kb([("➕ إضافة", "per:obl:add")], [("📊 حالة", "per:obl:list")],
+                                        [("↩️ رجوع", "per:menu"), BACK_HOME]))
 
 
 @on_state("per:obl_name")
 def st_obl_name(ctx):
     v = core.clean_text(ctx.text, 100, True)
-    if not v:
-        ctx.send("أدخل اسم الالتزام:")
-        return
-    ctx.go("per:obl_amt", obl_name=v)
-    ctx.reply("أدخل المبلغ الشهري:", kb([("❌ إلغاء", "per:obl")]))
+    if not v: ctx.send("أدخل الاسم:"); return
+    ctx.go("per:obl_amt", obl_name=v); ctx.reply("أدخل المبلغ الشهري:", kb([("❌ إلغاء", "per:obl")]))
 
 
 @on_state("per:obl_amt")
 def st_obl_amt(ctx):
     v = parse_float(ctx.text, 0.0)
-    if v is None or v <= 0:
-        ctx.send("أدخل مبلغاً صحيحاً أكبر من صفر:")
-        return
-    ctx.go("per:obl_day", obl_amt=v)
-    ctx.reply("أدخل يوم السداد (1-31):", kb([("❌ إلغاء", "per:obl")]))
+    if v is None or v <= 0: ctx.send("أدخل مبلغاً:"); return
+    ctx.go("per:obl_day", obl_amt=v); ctx.reply("أدخل يوم السداد (1-31):", kb([("❌ إلغاء", "per:obl")]))
 
 
 @on_state("per:obl_day")
 def st_obl_day(ctx):
     v = parse_int(ctx.text, 1, 31)
-    if v is None:
-        ctx.send("أدخل يوماً بين 1 و 31:")
-        return
+    if v is None: ctx.send("أدخل يوماً بين 1 و31:"); return
     db.run("INSERT INTO personal_obligations (client_num, name, amount, due_day) VALUES (:c, :n, :a, :d)",
            c=_cn(ctx), n=ctx.data.get("obl_name"), a=ctx.data.get("obl_amt"), d=v)
     ctx.reset()
-    ctx.reply("✅ تم حفظ الالتزام: <b>%s</b>\nالمبلغ: %s %s\nيوم السداد: %s من كل شهر"
+    ctx.reply("✅ الالتزام: <b>%s</b>\nالمبلغ: %s %s\nيوم %s"
               % (esc(ctx.data.get("obl_name", "")), fmt_num(ctx.data.get("obl_amt")), _u(ctx), v),
-              kb([("📊 حالة الالتزامات", "per:obl:list")], [("➕ التزام آخر", "per:obl:add")], [BACK_HOME]))
+              kb([("📊 حالة", "per:obl:list")], [("➕ آخر", "per:obl:add")], [BACK_HOME]))
 
 
 def _obl_list(ctx):
-    rows = db.rows("SELECT * FROM personal_obligations WHERE client_num = :c ORDER BY obligation_id",
-                   c=_cn(ctx))
+    rows = db.rows("SELECT * FROM personal_obligations WHERE client_num = :c ORDER BY obligation_id", c=_cn(ctx))
     if not rows:
-        ctx.reply("🔔 لا توجد التزامات مسجلة.", kb([("➕ إضافة التزام", "per:obl:add")], [("↩️ رجوع", "per:obl")]))
-        return
+        ctx.reply("🔔 لا التزامات.", kb([("➕ إضافة", "per:obl:add")], [("↩️ رجوع", "per:obl")])); return
     u = _u(ctx)
     total_month = sum(float(r["amount"]) for r in rows)
     paid_month = sum(float(r["amount"]) for r in rows if r["is_paid_this_month"])
-    lines = ["🔔 <b>الالتزامات الشهرية</b>",
+    lines = ["🔔 <b>الالتزامات</b>",
              "الإجمالي: %s %s | المسدد: %s %s | المتبقي: %s %s"
              % (fmt_num(total_month), u, fmt_num(paid_month), u, fmt_num(total_month - paid_month), u), ""]
     btns = []
     for r in rows:
-        status = "✅ تم السداد" if r["is_paid_this_month"] else "⏳ لم يُسدد"
+        status = "✅" if r["is_paid_this_month"] else "⏳"
         lines.append("<b>%s</b> — %s %s | يوم %s | %s"
                      % (esc(r["name"]), fmt_num(r["amount"]), u, r["due_day"], status))
         if not r["is_paid_this_month"]:
             btns.append([("✅ سداد %s" % r["name"][:20], "per:obl:paid:%d" % r["obligation_id"])])
         else:
             btns.append([("🗑 حذف %s" % r["name"][:20], "per:obl:del:%d" % r["obligation_id"])])
-    btns.append([("➕ إضافة التزام", "per:obl:add")])
-    btns.append([("↩️ رجوع", "per:obl"), BACK_HOME])
+    btns.append([("➕ إضافة", "per:obl:add")]); btns.append([("↩️ رجوع", "per:obl"), BACK_HOME])
     ctx.reply("\n".join(lines), kb(*btns))
 
 
 def _obl_pay(ctx, oid):
     db.run("UPDATE personal_obligations SET is_paid_this_month = 1, last_paid_at = SYSDATE "
            "WHERE obligation_id = :id AND client_num = :c", id=oid, c=_cn(ctx))
-    ctx.reply("✅ تم تسجيل سداد الالتزام لهذا الشهر.", kb([("📊 الحالة", "per:obl:list")]))
+    ctx.reply("✅ تم تسجيل السداد.", kb([("📊 الحالة", "per:obl:list")]))
 
 
 def _obl_delete(ctx, oid):
-    db.run("DELETE FROM personal_obligations WHERE obligation_id = :id AND client_num = :c",
-           id=oid, c=_cn(ctx))
-    ctx.reply("✅ تم حذف الالتزام.", kb([("🔔 الالتزامات", "per:obl"), BACK_HOME]))
+    db.run("DELETE FROM personal_obligations WHERE obligation_id = :id AND client_num = :c", id=oid, c=_cn(ctx))
+    ctx.reply("✅ تم الحذف.", kb([("🔔 الالتزامات", "per:obl"), BACK_HOME]))
 
 
-# ═══════════════════ التقرير الشخصي الشامل ═══════════════════
+# ═══════════════════ التقرير الشامل ═══════════════════
 def _report(ctx):
-    cn = _cn(ctx)
-    u = _u(ctx)
-    income = db.one("SELECT NVL(SUM(amount),0) AS m FROM personal_income WHERE client_num=:c AND " + _month_start_cond(), c=cn)
-    expense = db.one("SELECT NVL(SUM(amount),0) AS m FROM personal_expenses WHERE client_num=:c AND " + _month_start_cond(), c=cn)
+    cn = _cn(ctx); u = _u(ctx)
+    income = db.one("SELECT NVL(SUM(amount),0) AS m FROM personal_income WHERE client_num=:c AND " + _month_cond(), c=cn)
+    expense = db.one("SELECT NVL(SUM(amount),0) AS m FROM personal_expenses WHERE client_num=:c AND " + _month_cond(), c=cn)
     top_exp = db.one("SELECT category, NVL(SUM(amount),0) AS t FROM personal_expenses "
-                     "WHERE client_num=:c AND " + _month_start_cond() +
+                     "WHERE client_num=:c AND " + _month_cond() +
                      " GROUP BY category ORDER BY t DESC LIMIT 1", c=cn)
     for_me = db.one("SELECT NVL(SUM(amount - paid_amount),0) AS t FROM personal_debts "
                     "WHERE client_num=:c AND direction='for_me'", c=cn)
@@ -3503,650 +3272,37 @@ def _report(ctx):
     obl = db.one("SELECT COUNT(*) AS c, NVL(SUM(amount),0) AS total, "
                  "NVL(SUM(CASE WHEN is_paid_this_month=1 THEN amount ELSE 0 END),0) AS paid "
                  "FROM personal_obligations WHERE client_num=:c", c=cn)
-    m_inc, m_exp = float(income["m"]), float(expense["m"])
-    net = m_inc - m_exp
+    m_inc, m_exp = float(income["m"]), float(expense["m"]); net = m_inc - m_exp
     status = "🟢 ربح" if net >= 0 else "🔴 خسارة"
-    text = ("📊 <b>التقرير الشخصي الشامل</b>\n\n"
-            "<b>💼 الميزانية (هذا الشهر):</b>\n"
-            "💰 الدخل: %s %s\n"
-            "💸 المصاريف: %s %s\n"
-            "📊 الصافي: <b>%s</b> %s (%s)\n"
-            % (fmt_num(m_inc), u, fmt_num(m_exp), u, fmt_num(net), u, status))
+    text = ("📊 <b>التقرير الشخصي الشامل</b>\n\n<b>💼 الشهر:</b>\n💰 الدخل: %s %s\n💸 المصاريف: %s %s\n"
+            "📊 الصافي: <b>%s</b> %s (%s)\n" % (fmt_num(m_inc), u, fmt_num(m_exp), u, fmt_num(net), u, status))
     if top_exp:
-        text += "🏷 أكثر تصنيف صرفت فيه: <b>%s</b> (%s %s)\n" % (
-            EXPENSE_CATS.get(top_exp["category"], top_exp["category"]),
-            fmt_num(top_exp["t"]), u)
-    text += ("\n<b>🤝 الديون:</b>\n"
-             "💚 ديون لي: %s %s\n"
-             "🔴 ديون عليّ: %s %s\n"
-             "📊 صافي الديون: <b>%s</b> %s\n"
+        text += "🏷 أكثر تصنيف: <b>%s</b> (%s %s)\n" % (EXPENSE_CATS.get(top_exp["category"], top_exp["category"]),
+                                                     fmt_num(top_exp["t"]), u)
+    text += ("\n<b>🤝 الديون:</b>\n💚 لي: %s %s\n🔴 عليّ: %s %s\n📊 صافي: <b>%s</b> %s\n"
              % (fmt_num(for_me["t"]), u, fmt_num(on_me["t"]), u,
                 fmt_num(float(for_me["t"]) - float(on_me["t"])), u))
-    text += ("\n<b>🎯 الأهداف:</b>\n"
-             "عدد: %s | جمعت: %s / %s %s\n"
+    text += ("\n<b>🎯 الأهداف:</b>\nعدد: %s | جمعت: %s / %s %s\n"
              % (goals["c"], fmt_num(goals["s"]), fmt_num(goals["t"]), u))
-    text += ("\n<b>🔔 الالتزامات الشهرية:</b>\n"
-             "عدد: %s | الإجمالي: %s | المسدد: %s | المتبقي: <b>%s</b> %s"
+    text += ("\n<b>🔔 الالتزامات:</b>\nعدد: %s | الإجمالي: %s | المسدد: %s | المتبقي: <b>%s</b> %s"
              % (obl["c"], fmt_num(obl["total"]), fmt_num(obl["paid"]),
                 fmt_num(float(obl["total"]) - float(obl["paid"])), u))
-    ctx.reply(text, kb([("💸 المصاريف", "per:exp"), ("💰 الدخل", "per:inc")], [BACK_HOME]))
+    ctx.reply(text, kb([("💸 المصاريف", "per:exp"), ("💰 الدخل", "per:inc")],
+                       [("📞 تواصل معنا", "support:home")], [BACK_HOME]))
 '''
 
-# ════════════════════ reports.py ════════════════════
-SOURCES['reports'] = r'''"""التقارير الشاملة والتعديلات — مطابق Statement.java بأقسامه الثمانية."""
+
+
+
+# ════════════════════ admin.py (الشامل مع إضافة مستخدمين) ════════════════════
+SOURCES['admin'] = r'''"""لوحة الإدارة الشاملة — تحكم كامل بالبوت (للمدراء فقط: ADMIN_IDS)."""
 from __future__ import annotations
-
 import logging
-
-import core
-import db
-from core import (BACK_HOME, LIKE_ESC, clean_text, esc, fmt_dt, fmt_num, kb, like, on_cb, on_state,
-                  parse_int, stock_text, unit_of)
-from pickers import (cust_purpose, debt_totals, find_products, get_customer, prod_purpose,
-                     start_cust_search, start_prod_search)
-from shop import KIND_LABEL, archive_and_delete_debts
-
-log = logging.getLogger("reports")
-
-SALES_TABLE = {"c": ("cash_sales", "sale_date", "total_amount"),
-               "n": ("network_sales", "sale_date", "total_amount"),
-               "d": ("shop_debts", "debt_date", "debt_amount")}
-SEP = "─────────────"
-
-
-def _u(ctx):
-    return unit_of(ctx.client)
-
-
-def _cond(col, period):
-    if period == "day":
-        return "TRUNC(%s) = TRUNC(SYSDATE)" % col
-    return "TRUNC(%s, 'MM') = TRUNC(SYSDATE, 'MM')" % col
-
-
-def page_sql(sql, page, size):
-    lo = page * size
-    return ("SELECT * FROM (SELECT q.*, ROWNUM AS rn__ FROM (%s) q WHERE ROWNUM <= %d) WHERE rn__ > %d"
-            % (sql, lo + size + 1, lo))
-
-
-def _page_arg(r, idx):
-    return int(r[idx]) if len(r) > idx and r[idx].isdigit() else 0
-
-
-def show_page(ctx, title, lines, page, has_next, base, back, header=None):
-    text = title
-    if header:
-        text += "\n" + header
-    text += "\n\n" + ("\n".join(lines) if lines else "⚠️ لا توجد بيانات.")
-    if page or has_next:
-        text += "\n\n<i>صفحة %d</i>" % (page + 1)
-    nav = []
-    if page > 0:
-        nav.append(("◀️ السابق", "%s:%d" % (base, page - 1)))
-    if has_next:
-        nav.append(("التالي ▶️", "%s:%d" % (base, page + 1)))
-    rows = ([nav] if nav else []) + [[("↩️ رجوع", back), BACK_HOME]]
-    ctx.reply(text, kb(*rows))
-
-
-def _back(ctx, text, back, extra_rows=None):
-    rows = (extra_rows or []) + [[("↩️ رجوع", back), BACK_HOME]]
-    ctx.reply(text, kb(*rows))
-
-
-@on_cb("rp")
-def cb_rp(ctx):
-    a = ctx.args
-    sec = a[0] if a else "menu"
-    fn = SECTIONS.get(sec)
-    if sec == "menu" or fn is None:
-        ctx.reset()
-        ctx.reply("===== 📊 شاشة التقارير الشاملة والتعديلات =====\nاختر رقم التقرير:",
-                  kb([("1. المنتجات", "rp:1"), ("2. العملاء", "rp:2")],
-                     [("3. كشف المبيعات والاستيراد", "rp:3")],
-                     [("4. الأرباح", "rp:4"), ("5. الديون", "rp:5")],
-                     [("6. التعديلات (حذف)", "rp:6")],
-                     [("7. بحث عن عمليات بيع", "rp:7")],
-                     [("8. تقرير حركة المنتجات", "rp:8")],
-                     [BACK_HOME]))
-        return
-    fn(ctx, a[1:])
-
-
-def sec_products(ctx, r):
-    cn = ctx.client["num"]
-    sub = r[0] if r else None
-    u = _u(ctx)
-    if sub is None:
-        ctx.reset()
-        total = db.val("SELECT COUNT(*) FROM products_table", 0)
-        ctx.reply("--- 📦 تقارير المنتجات ---\n📦 إجمالي عدد المنتجات المسجلة: <b>%s</b> منتج" % total,
-                  kb([("🚚 حساب عدد الكراتين المستوردة", "rp:1:cartons")],
-                     [("🔎 بحث عن منتج معين", "rp:1:search")],
-                     [("📋 كشف بجميع المنتجات (مع التفاصيل)", "rp:1:all:0")],
-                     [("↩️ رجوع", "rp:menu"), BACK_HOME]))
-    elif sub == "cartons":
-        v = db.val("SELECT NVL(SUM(number_of_cartons), 0) FROM imports_table WHERE client_num = :p_cn", 0, p_cn=cn)
-        _back(ctx, "📦 إجمالي الكراتين التي قمت باستيرادها: <b>%s</b> كرتون" % fmt_num(v), "rp:1")
-    elif sub == "search":
-        ctx.go("rp:psearch")
-        ctx.reply("أدخل اسم المنتج للبحث:", kb([("↩️ رجوع", "rp:1")]))
-    elif sub == "all":
-        page = _page_arg(r, 1)
-        rows = db.rows(page_sql("SELECT product_name, NVL(purchase_price, 0) AS pp, NVL(price, 0) AS sp, "
-                                "NVL(quantity, 0) AS qty, NVL(units_per_carton, 1) AS upc "
-                                "FROM products_table ORDER BY product_name", page, 8))
-        has_next = len(rows) > 8
-        lines = []
-        for x in rows[:8]:
-            lines.append("📦 <b>%s</b>\nالشراء: %s | البيع: %s | الربح: %s\nالمتبقي: %s"
-                         % (esc(x["product_name"]), fmt_num(x["pp"]), fmt_num(x["sp"]),
-                            fmt_num(float(x["sp"]) - float(x["pp"])), stock_text(x["qty"], x["upc"])))
-        show_page(ctx, "--- 📋 كشف جميع المنتجات (التفصيلي) ---", lines, page, has_next, "rp:1:all", "rp:1")
-
-
-@on_state("rp:psearch")
-def st_psearch(ctx):
-    q = (ctx.text or "").strip()
-    if not q:
-        ctx.send("أدخل اسم المنتج للبحث:")
-        return
-    rows = find_products(q)
-    ctx.reset()
-    if not rows:
-        ctx.send("⚠️ المنتج غير موجود.", kb([("🔁 بحث آخر", "rp:1:search"), ("↩️ رجوع", "rp:1")]))
-        return
-    u = _u(ctx)
-    lines = ["📦 <b>%s</b> | السعر: %s %s | المتبقي: %s"
-             % (esc(x["product_name"]), fmt_num(x["price"]), u, stock_text(x["quantity"], x["units_per_carton"]))
-             for x in rows[:10]]
-    if len(rows) > 10:
-        lines.append("… (يوجد نتائج أكثر، حدّد الاسم بدقة)")
-    ctx.send("\n".join(lines), kb([("🔁 بحث آخر", "rp:1:search"), ("↩️ رجوع", "rp:1")]))
-
-
-def sec_customers(ctx, r):
-    cn = ctx.client["num"]
-    sub = r[0] if r else None
-    u = _u(ctx)
-    if sub is None:
-        ctx.reset()
-        total = db.val("SELECT COUNT(*) FROM shop_customers WHERE client_num = :p_cn", 0, p_cn=cn)
-        ctx.reply("--- 👥 تقارير العملاء ---\n👥 إجمالي عدد عملائك: <b>%s</b> عميل" % total,
-                  kb([("🔎 بحث عن عميل (كشف حساب للديون)", "rp:2:search")],
-                     [("📋 كشف بجميع العملاء (مع إجمالي الديون)", "rp:2:all:0")],
-                     [("↩️ رجوع", "rp:menu"), BACK_HOME]))
-    elif sub == "search":
-        start_cust_search(ctx, "rp_cust", back="rp:2")
-    elif sub == "all":
-        page = _page_arg(r, 1)
-        rows = db.rows(page_sql(
-            "SELECT c.customer_name AS cname, c.customer_phone AS cphone, "
-            "NVL(SUM(d.debt_amount - NVL(d.paid_amount, 0)), 0) AS remain "
-            "FROM shop_customers c LEFT JOIN shop_debts d ON c.customer_phone = d.customer_phone "
-            "AND c.client_num = d.client_num WHERE c.client_num = :p_cn "
-            "GROUP BY c.customer_name, c.customer_phone ORDER BY c.customer_name", page, 15), p_cn=cn)
-        has_next = len(rows) > 15
-        lines = ["- العميل: <b>%s</b> | الرقم: %s | دينه المتبقي: %s %s"
-                 % (esc(x["cname"]), x["cphone"], fmt_num(x["remain"]), u) for x in rows[:15]]
-        show_page(ctx, "--- 📋 قائمة جميع العملاء (مع الأرصدة) ---", lines, page, has_next, "rp:2:all", "rp:2")
-
-
-@cust_purpose("rp_cust")
-def rp_cust_picked(ctx, c):
-    td, tp, rem = debt_totals(c["phone"], ctx.client["num"])
-    u = _u(ctx)
-    ctx.reset()
-    _back(ctx, "👤 العميل: <b>%s</b> | الرقم: %s\nإجمالي الدين: %s | إجمالي ما سدده: %s | المتبقي عليه: <b>%s</b> %s"
-          % (esc(c["name"]), c["phone"], fmt_num(td), fmt_num(tp), fmt_num(rem), u), "rp:2",
-          [[("📄 ملف كشف الحساب", "stm:%s" % c["phone"])]])
-
-
-def sec_sales(ctx, r):
-    cn = ctx.client["num"]
-    sub = r[0] if r else None
-    u = _u(ctx)
-    if sub is None:
-        ctx.reset()
-        ctx.reply("--- 📊 تقارير المبيعات والاستيراد ---",
-                  kb([("💰 المبيعات اليومية (كاش فقط)", "rp:3:1")],
-                     [("📅 المبيعات الشهرية (كاش + تسديدات الديون)", "rp:3:2")],
-                     [("🚛 الاستيراد الشهري", "rp:3:3")],
-                     [("💵 تسديدات الديون (المسددة فقط)", "rp:3:4")],
-                     [("📊 كشف المبيعات التحليلي الشامل", "rp:3:5")],
-                     [("↩️ رجوع", "rp:menu"), BACK_HOME]))
-    elif sub == "1":
-        cash = db.val("SELECT NVL(SUM(total_amount), 0) FROM cash_sales WHERE client_num = :p_cn AND "
-                      + _cond("sale_date", "day"), 0, p_cn=cn)
-        net = db.val("SELECT NVL(SUM(total_amount), 0) FROM network_sales WHERE client_num = :p_cn AND "
-                     + _cond("sale_date", "day"), 0, p_cn=cn)
-        _back(ctx, "💰 إجمالي المبيعات اليومية (نقداً فقط): <b>%s</b> %s\n💳 مبيعات الشبكة اليوم: %s %s"
-              % (fmt_num(cash), u, fmt_num(net), u), "rp:3")
-    elif sub == "2":
-        cash = db.val("SELECT NVL(SUM(total_amount), 0) FROM cash_sales WHERE client_num = :p_cn AND "
-                      + _cond("sale_date", "month"), 0, p_cn=cn)
-        net = db.val("SELECT NVL(SUM(total_amount), 0) FROM network_sales WHERE client_num = :p_cn AND "
-                     + _cond("sale_date", "month"), 0, p_cn=cn)
-        paid = db.val("SELECT NVL(SUM(paid_amount), 0) FROM shop_debts WHERE client_num = :p_cn AND "
-                      + _cond("debt_date", "month"), 0, p_cn=cn)
-        _back(ctx, "📅 <b>مبيعات هذا الشهر</b>\n💰 كاش: %s %s\n💳 شبكة: %s %s\n💵 تسديدات الديون: %s %s\n%s\n"
-              "الإجمالي (كاش + تسديدات): <b>%s</b> %s\nالإجمالي مع مبيعات الشبكة: <b>%s</b> %s"
-              % (fmt_num(cash), u, fmt_num(net), u, fmt_num(paid), u, SEP,
-                 fmt_num(float(cash) + float(paid)), u, fmt_num(float(cash) + float(net) + float(paid)), u), "rp:3")
-    elif sub == "3":
-        v = db.val("SELECT NVL(SUM(full_amount), 0) FROM imports_table WHERE client_num = :p_cn AND "
-                   + _cond("import_date", "month"), 0, p_cn=cn)
-        _back(ctx, "🚛 إجمالي الاستيراد هذا الشهر: <b>%s</b> %s" % (fmt_num(v), u), "rp:3")
-    elif sub == "4":
-        v = db.val("SELECT NVL(SUM(paid_amount), 0) FROM shop_debts WHERE client_num = :p_cn", 0, p_cn=cn)
-        _back(ctx, "💵 إجمالي تسديدات الديون المستلمة: <b>%s</b> %s" % (fmt_num(v), u), "rp:3")
-    elif sub == "5":
-        _analytic(ctx)
-
-
-def _analytic(ctx):
-    cn = ctx.client["num"]
-    u = _u(ctx)
-    row = db.one(
-        "SELECT "
-        "(SELECT NVL(SUM(total_amount),0) FROM cash_sales WHERE client_num = :p_cn AND TRUNC(sale_date) = TRUNC(SYSDATE)) AS today_cash, "
-        "(SELECT NVL(SUM(total_amount),0) FROM network_sales WHERE client_num = :p_cn AND TRUNC(sale_date) = TRUNC(SYSDATE)) AS today_network, "
-        "(SELECT NVL(SUM(debt_amount),0) FROM shop_debts WHERE client_num = :p_cn AND TRUNC(debt_date) = TRUNC(SYSDATE)) AS today_debt, "
-        "(SELECT NVL(SUM(total_amount),0) FROM cash_sales WHERE client_num = :p_cn AND TRUNC(sale_date, 'MM') = TRUNC(SYSDATE, 'MM')) AS month_cash, "
-        "(SELECT NVL(SUM(total_amount),0) FROM network_sales WHERE client_num = :p_cn AND TRUNC(sale_date, 'MM') = TRUNC(SYSDATE, 'MM')) AS month_network, "
-        "(SELECT NVL(SUM(debt_amount),0) FROM shop_debts WHERE client_num = :p_cn AND TRUNC(debt_date, 'MM') = TRUNC(SYSDATE, 'MM')) AS month_new_debt, "
-        "(SELECT NVL(SUM(paid_amount),0) FROM shop_debts WHERE client_num = :p_cn AND TRUNC(debt_date, 'MM') = TRUNC(SYSDATE, 'MM')) AS month_paid_debt, "
-        "(SELECT NVL(SUM(debt_amount - NVL(paid_amount, 0)),0) FROM shop_debts WHERE client_num = :p_cn) AS total_remaining_debts "
-        "FROM dual", p_cn=cn)
-    f = lambda k: float(row[k] or 0)
-    text = ("===== 📊 كشف المبيعات التحليلي =====\n\n"
-            "<b>🟢 المبيعات اليومية (اليوم)</b>\n💰 كاش: %s %s\n💳 شبكة: %s %s\n📝 ديون مسجلة اليوم: %s %s\n"
-            "إجمالي مبيعات اليوم: <b>%s</b> %s\n\n"
-            "<b>🔵 المبيعات الشهرية (هذا الشهر)</b>\n💰 كاش: %s %s\n💳 شبكة: %s %s\n📝 ديون جديدة هذا الشهر: %s %s\n\n"
-            "<b>🔴 حركة الديون</b>\n✅ الديون المُسددة (المستلمة) هذا الشهر: %s %s\n"
-            "⚠️ إجمالي الديون المتبقية في السوق: <b>%s</b> %s"
-            % (fmt_num(f("today_cash")), u, fmt_num(f("today_network")), u, fmt_num(f("today_debt")), u,
-               fmt_num(f("today_cash") + f("today_network") + f("today_debt")), u,
-               fmt_num(f("month_cash")), u, fmt_num(f("month_network")), u, fmt_num(f("month_new_debt")), u,
-               fmt_num(f("month_paid_debt")), u, fmt_num(f("total_remaining_debts")), u))
-    _back(ctx, text, "rp:3")
-
-
-def _profit_sql(period):
-    parts = []
-    for src, table, col in (("cash", "cash_sales", "sale_date"), ("net", "network_sales", "sale_date"),
-                            ("debt", "shop_debts", "debt_date")):
-        parts.append("SELECT '%s' AS src, product_name, single_price, quantity FROM %s "
-                     "WHERE client_num = :p_cn AND %s" % (src, table, _cond(col, period)))
-    return ("SELECT s.src AS src, NVL(SUM((s.single_price - NVL(p.purchase_price, 0)) * s.quantity), 0) AS profit "
-            "FROM (" + " UNION ALL ".join(parts) + ") s "
-            "JOIN products_table p ON LOWER(s.product_name) = LOWER(p.product_name) GROUP BY s.src")
-
-
-def sec_profits(ctx, r):
-    sub = r[0] if r else None
-    u = _u(ctx)
-    if sub is None:
-        ctx.reset()
-        ctx.reply("--- 💹 تقارير الأرباح الصافية ---",
-                  kb([("📈 الأرباح اليومية", "rp:4:day")], [("📊 الأرباح الشهرية", "rp:4:month")],
-                     [("↩️ رجوع", "rp:menu"), BACK_HOME]))
-    elif sub in ("day", "month"):
-        rows = db.rows(_profit_sql(sub), p_cn=ctx.client["num"])
-        v = {x["src"].strip(): float(x["profit"] or 0) for x in rows}
-        cash, net, debt = v.get("cash", 0.0), v.get("net", 0.0), v.get("debt", 0.0)
-        title = "📈 صافي أرباح اليوم" if sub == "day" else "📊 صافي أرباح هذا الشهر"
-        _back(ctx, "%s (بعد خصم رأس المال)\n💰 أرباح الكاش: <b>%s</b> %s\n"
-                   "💳 أرباح الشبكة: %s %s\n📝 أرباح الديون المسجلة: %s %s\n%s\nالإجمالي: <b>%s</b> %s"
-              % (title, fmt_num(cash), u, fmt_num(net), u, fmt_num(debt), u, SEP,
-                 fmt_num(cash + net + debt), u), "rp:4")
-
-
-def sec_debts(ctx, r):
-    cn = ctx.client["num"]
-    sub = r[0] if r else None
-    u = _u(ctx)
-    if sub is None:
-        ctx.reset()
-        total = db.val("SELECT NVL(SUM(debt_amount - NVL(paid_amount, 0)), 0) FROM shop_debts "
-                       "WHERE client_num = :p_cn", 0, p_cn=cn)
-        ctx.reply("--- 🔴 تقارير الديون ---\n🔴 إجمالي الديون في السوق: <b>%s</b> %s" % (fmt_num(total), u),
-                  kb([("👤 كشف حساب لعميل محدد", "rp:5:cust")],
-                     [("📋 كشف ديون جميع العملاء (الشامل)", "rp:5:all:0")],
-                     [("🔢 بحث عن دين برقم الفاتورة", "rp:5:inv")],
-                     [("↩️ رجوع", "rp:menu"), BACK_HOME]))
-    elif sub == "cust":
-        start_cust_search(ctx, "rp_debt", back="rp:5")
-    elif sub == "all":
-        page = _page_arg(r, 1)
-        rows = db.rows(page_sql(
-            "SELECT customer_name, product_name, quantity, debt_amount, NVL(paid_amount, 0) AS paid, "
-            "debt_date, invoice_num FROM shop_debts WHERE client_num = :p_cn ORDER BY customer_name, debt_id",
-            page, 10), p_cn=cn)
-        has_next = len(rows) > 10
-        lines = ["العميل: <b>%s</b> | المنتج: %s | الكمية: %s | المبلغ: %s %s%s | الوقت: %s"
-                 % (esc(x["customer_name"]), esc(x["product_name"]), fmt_num(x["quantity"]),
-                    fmt_num(x["debt_amount"]), u,
-                    " (مسدد %s)" % fmt_num(x["paid"]) if float(x["paid"] or 0) else "", fmt_dt(x["debt_date"]))
-                 for x in rows[:10]]
-        if not rows and page == 0:
-            lines = ["السوق نظيف، لا توجد ديون حالياً!"]
-        show_page(ctx, "--- 📋 الكشف الشامل لجميع ديون السوق ---", lines, page, has_next, "rp:5:all", "rp:5")
-    elif sub == "inv":
-        ctx.go("rp:dinv")
-        ctx.reply("أدخل رقم الفاتورة للبحث:", kb([("↩️ رجوع", "rp:5")]))
-
-
-@on_state("rp:dinv")
-def st_dinv(ctx):
-    n = parse_int(ctx.text, 0)
-    if n is None:
-        ctx.send("أدخل رقم الفاتورة (أرقام فقط):")
-        return
-    x = db.one("SELECT customer_name, product_name, quantity, debt_amount, debt_date FROM shop_debts "
-               "WHERE invoice_num = :p_n AND client_num = :p_cn", p_n=n, p_cn=ctx.client["num"])
-    ctx.reset()
-    if not x:
-        ctx.send("⚠️ لم يتم العثور على أي دين يحمل رقم الفاتورة هذا.", kb([("↩️ رجوع", "rp:5")]))
-        return
-    ctx.send("--- 🧾 تفاصيل فاتورة الدين رقم [%s] ---\n👤 العميل: %s\n📦 المنتج: %s\n🔢 الكمية: %s\n"
-             "💰 إجمالي الدين: <b>%s</b> %s\n📅 تاريخ الفاتورة: %s"
-             % (n, esc(x["customer_name"]), esc(x["product_name"]), fmt_num(x["quantity"]),
-                fmt_num(x["debt_amount"]), _u(ctx), fmt_dt(x["debt_date"])),
-             kb([("🖨️ ملف الفاتورة", "inv:d:%s" % n)], [("↩️ رجوع", "rp:5"), BACK_HOME]))
-
-
-@cust_purpose("rp_debt")
-def rp_debt_picked(ctx, c):
-    cn = ctx.client["num"]
-    u = _u(ctx)
-    rows = db.rows("SELECT * FROM (SELECT product_name, quantity, debt_amount, debt_date FROM shop_debts "
-                   "WHERE customer_phone = :p_ph AND client_num = :p_cn ORDER BY debt_id) WHERE ROWNUM <= 40",
-                   p_ph=c["phone"], p_cn=cn)
-    td, tp, rem = debt_totals(c["phone"], cn)
-    ctx.reset()
-    lines = ["--- كشف حساب العميل [<b>%s</b>] ---" % esc(c["name"])]
-    if not rows:
-        lines.append("لا توجد ديون مسجلة باسم هذا العميل.")
-        _back(ctx, "\n".join(lines), "rp:5")
-        return
-    for x in rows:
-        lines.append("المنتج: %s | الكمية: %s | المبلغ: %s %s | الوقت: %s"
-                     % (esc(x["product_name"]), fmt_num(x["quantity"]), fmt_num(x["debt_amount"]), u,
-                        fmt_dt(x["debt_date"])))
-    lines += [SEP, "إجمالي الديون المسجلة عليه: <b>%s</b> %s" % (fmt_num(td), u),
-              "المسدد: %s | المتبقي: <b>%s</b> %s" % (fmt_num(tp), fmt_num(rem), u)]
-    _back(ctx, "\n".join(lines), "rp:5", [[("🖨️ طباعة كشف الحساب (ملف)", "stm:%s" % c["phone"])]])
-
-
-@on_cb("stm")
-def cb_stm(ctx):
-    if not ctx.args or not ctx.args[0].isdigit():
-        return
-    cn = ctx.client["num"]
-    c = get_customer(cn, int(ctx.args[0]))
-    if not c:
-        ctx.send("⚠️ العميل غير موجود.")
-        return
-    u = _u(ctx)
-    rows = db.rows("SELECT product_name, quantity, debt_amount, debt_date FROM shop_debts "
-                   "WHERE customer_phone = :p_ph AND client_num = :p_cn ORDER BY debt_id",
-                   p_ph=c["phone"], p_cn=cn)
-    td, tp, rem = debt_totals(c["phone"], cn)
-    L = ["====================================", "         كشف حساب ديون عميل         ",
-         "===================================="]
-    if ctx.client.get("shop_name"):
-        L.append("المحل: %s" % ctx.client["shop_name"])
-    L += ["اسم العميل: %s" % c["name"], "رقم الهاتف: %s" % c["phone"], "------------------------------------"]
-    for x in rows:
-        L += ["المنتج: %s" % x["product_name"],
-              "الكمية: %s | المبلغ: %s %s" % (fmt_num(x["quantity"]), fmt_num(x["debt_amount"]), u),
-              "التاريخ: %s" % fmt_dt(x["debt_date"]), "------------------------------------"]
-    L += ["إجمالي الديون المسجلة: %s %s" % (fmt_num(td), u), "المسدد: %s %s" % (fmt_num(tp), u),
-          "المتبقي: %s %s" % (fmt_num(rem), u), "====================================",
-          "       يرجى سداد المبالغ قريباً     "]
-    ctx.doc("Debt_Statement_%s.txt" % c["phone"], "\n".join(L), caption="🖨️ كشف حساب %s" % c["name"])
-
-
-def sec_modify(ctx, r):
-    sub = r[0] if r else None
-    if sub is None:
-        ctx.reset()
-        ctx.reply("--- ✏️ قسم التعديلات ---\n⚠️ الحذف يتم بعد تأكيدك.",
-                  kb([("🗑 حذف عميل", "rp:6:c")], [("🗑 حذف منتج", "rp:6:p")],
-                     [("🗑 حذف ديون عميل", "rp:6:d")], [("↩️ رجوع", "rp:menu"), BACK_HOME]))
-    elif sub == "c":
-        start_cust_search(ctx, "delc", back="rp:6")
-    elif sub == "p":
-        start_prod_search(ctx, "delp", prompt="أدخل اسم المنتج لحذفه:", back="rp:6")
-    elif sub == "d":
-        start_cust_search(ctx, "deld", back="rp:6")
-
-
-@cust_purpose("delc")
-def delc_picked(ctx, c):
-    td, tp, rem = debt_totals(c["phone"], ctx.client["num"])
-    warn = "\n⚠️ عليه دين متبقي %s %s (ستبقى سجلات الدين ولن تُحذف)." % (fmt_num(rem), _u(ctx)) if rem > 0 else ""
-    ctx.reset()
-    ctx.reply("🗑 تأكيد حذف العميل <b>%s</b> (%s)؟%s" % (esc(c["name"]), c["phone"], warn),
-              kb([("✅ نعم، احذف", "del:c:%s" % c["phone"])], [("❌ إلغاء", "rp:6")]))
-
-
-@prod_purpose("delp")
-def delp_picked(ctx, p):
-    ctx.reset()
-    ctx.reply("🗑 تأكيد حذف المنتج <b>%s</b>؟" % esc(p["product_name"]),
-              kb([("✅ نعم، احذف", "del:p:%s" % p["product_id"])], [("❌ إلغاء", "rp:6")]))
-
-
-@cust_purpose("deld")
-def deld_picked(ctx, c):
-    td, tp, rem = debt_totals(c["phone"], ctx.client["num"])
-    ctx.reset()
-    ctx.reply("🗑 تأكيد تصفير وحذف جميع ديون العميل <b>%s</b>؟\nالمتبقي عليه: %s %s\n"
-              "<i>(تُحفظ نسخة في الأرشيف)</i>" % (esc(c["name"]), fmt_num(rem), _u(ctx)),
-              kb([("✅ نعم، احذف", "del:d:%s" % c["phone"])], [("❌ إلغاء", "rp:6")]))
-
-
-@on_cb("del")
-def cb_del(ctx):
-    a = ctx.args
-    if len(a) < 2 or not a[1].isdigit():
-        return
-    kind, ident, cn = a[0], int(a[1]), ctx.client["num"]
-    back = [[("↩️ رجوع", "rp:6"), BACK_HOME]]
-    if kind == "c":
-        n = db.run("DELETE FROM shop_customers WHERE customer_phone = :p_ph AND client_num = :p_cn",
-                   p_ph=ident, p_cn=cn)
-        core.audit("DELETE_CUSTOMER", ctx, details="phone=%s" % ident)
-    elif kind == "p":
-        n = db.run("DELETE FROM products_table WHERE product_id = :p_id", p_id=ident)
-        core.audit("DELETE_PRODUCT", ctx, details="id=%s" % ident)
-    elif kind == "d":
-        with db.tx() as t:
-            n = archive_and_delete_debts(t, cn, ident, "DELETED")
-            core.audit("DELETE_DEBTS", ctx, details="phone=%s rows=%s" % (ident, n), t=t)
-    else:
-        return
-    ctx.reset()
-    ctx.reply("✅ تم الحذف بنجاح!" if n else "⚠️ لم يتم العثور على بيانات مطابقة للحذف.", kb(*back))
-
-
-def _union_sql(period):
-    parts = []
-    for typ, (table, col, amt) in (("cash", SALES_TABLE["c"]), ("net", SALES_TABLE["n"]), ("debt", SALES_TABLE["d"])):
-        parts.append("SELECT '%s' AS s_type, invoice_num, customer_name, customer_phone, product_name, quantity, "
-                     "%s AS amt, %s AS dt FROM %s WHERE client_num = :p_cn AND %s"
-                     % (typ, amt, col, table, _cond(col, period)))
-    return " UNION ALL ".join(parts)
-
-
-def sec_search(ctx, r):
-    cn = ctx.client["num"]
-    sub = r[0] if r else None
-    u = _u(ctx)
-    if sub is None:
-        ctx.reset()
-        ctx.reply("--- 🔍 بحث وتقارير المبيعات التفصيلية ---",
-                  kb([("💳 مبيعات الشبكة", "rp:7:n"), ("💰 مبيعات الكاش", "rp:7:c")],
-                     [("📝 مبيعات الديون", "rp:7:d")],
-                     [("📋 تقرير مفصل بجميع عمليات اليوم", "rp:7:day:0")],
-                     [("📋 تقرير مفصل بجميع عمليات الشهر", "rp:7:month:0")],
-                     [("↩️ رجوع", "rp:menu"), BACK_HOME]))
-    elif sub in SALES_TABLE:
-        label = {"c": "الكاش", "n": "الشبكة", "d": "الديون"}[sub]
-        ctx.reply("طريقة البحث في مبيعات %s:" % label,
-                  kb([("🔢 برقم الفاتورة", "rp:7:q:%s:inv" % sub)],
-                     [("👤 باسم الزبون", "rp:7:q:%s:name" % sub)],
-                     [("📞 برقم هاتف الزبون", "rp:7:q:%s:phone" % sub)],
-                     [("↩️ رجوع", "rp:7")]))
-    elif sub == "q" and len(r) > 2 and r[1] in SALES_TABLE and r[2] in ("inv", "name", "phone"):
-        ctx.go("rp:sq", rq_kind=r[1], rq_crit=r[2])
-        ctx.reply({"inv": "أدخل رقم الفاتورة:", "name": "أدخل اسم الزبون:", "phone": "أدخل رقم الهاتف:"}[r[2]],
-                  kb([("↩️ رجوع", "rp:7")]))
-    elif sub in ("day", "month"):
-        page = _page_arg(r, 1)
-        union = _union_sql(sub)
-        rows = db.rows(page_sql("SELECT s_type, invoice_num, customer_name, customer_phone, product_name, "
-                                "quantity, amt, dt FROM (" + union + ") ORDER BY dt DESC", page, 8), p_cn=cn)
-        has_next = len(rows) > 8
-        names = {"cash": "كاش", "net": "شبكة", "debt": "دين"}
-        lines = []
-        for x in rows[:8]:
-            lines.append("🔖 [%s] | الفاتورة: %s | %s\n👤 %s (%s)\n📦 %s | الكمية: %s | <b>%s</b> %s"
-                         % (names[x["s_type"].strip()], x["invoice_num"] if x["invoice_num"] is not None else "-",
-                            fmt_dt(x["dt"]), esc(x["customer_name"]), x["customer_phone"] or 0,
-                            esc(x["product_name"]), fmt_num(x["quantity"]), fmt_num(x["amt"]), u))
-        header = None
-        if page == 0:
-            tot = {x["s_type"].strip(): float(x["total"] or 0) for x in db.rows(
-                "SELECT s_type, NVL(SUM(amt), 0) AS total FROM (" + union + ") GROUP BY s_type", p_cn=cn)}
-            if tot:
-                header = ("💰 إجمالي الكاش: %s\n💳 إجمالي الشبكة: %s\n📝 إجمالي الديون: %s\n💵 الإجمالي الكلي: <b>%s</b> %s"
-                          % (fmt_num(tot.get("cash", 0)), fmt_num(tot.get("net", 0)), fmt_num(tot.get("debt", 0)),
-                             fmt_num(sum(tot.values())), u))
-        title = "=== 📋 التقرير المفصل لجميع عمليات (%s) ===" % ("اليوم" if sub == "day" else "هذا الشهر")
-        if not rows and page == 0:
-            lines = ["⚠️ لا توجد أي مبيعات مسجلة في %s." % ("اليوم" if sub == "day" else "هذا الشهر")]
-        show_page(ctx, title, lines, page, has_next, "rp:7:" + sub, "rp:7", header)
-
-
-@on_state("rp:sq")
-def st_sq(ctx):
-    kind, crit = ctx.data.get("rq_kind"), ctx.data.get("rq_crit")
-    if kind not in SALES_TABLE or crit not in ("inv", "name", "phone"):
-        ctx.reset()
-        ctx.send("انتهت صلاحية هذه الشاشة.", kb([("🔍 بحث", "rp:7")]))
-        return
-    table, dcol, amt = SALES_TABLE[kind]
-    sql = ("SELECT customer_name, customer_phone, product_name, quantity, single_price, %s AS total_amt, "
-           "invoice_num, %s AS d_date FROM %s WHERE client_num = :p_cn AND " % (amt, dcol, table))
-    if crit == "name":
-        v = (ctx.text or "").strip()
-        if not v:
-            ctx.send("أدخل اسم الزبون:")
-            return
-        sql += "LOWER(customer_name) LIKE :p_v" + LIKE_ESC
-        v = like(v)
-    else:
-        v = parse_int(ctx.text, 0, 999_999_999_999_999)
-        if v is None:
-            ctx.send("أدخل رقماً صحيحاً (أرقام فقط):")
-            return
-        sql += ("invoice_num = :p_v" if crit == "inv" else "customer_phone = :p_v")
-    rows = db.rows("SELECT * FROM (" + sql + " ORDER BY " + dcol + " DESC) WHERE ROWNUM <= 16",
-                   p_cn=ctx.client["num"], p_v=v)
-    ctx.reset()
-    u = _u(ctx)
-    label = {"c": "الكاش", "n": "الشبكة", "d": "الديون"}[kind]
-    if not rows:
-        ctx.send("⚠️ لا توجد نتائج مطابقة لبحثك.", kb([("🔁 بحث آخر", "rp:7:%s" % kind), ("↩️ رجوع", "rp:7")]))
-        return
-    lines = ["--- 🧾 نتائج البحث في قسم (%s) ---" % label]
-    for x in rows[:15]:
-        lines.append("الفاتورة: %s | الزبون: %s (%s)\nالمنتج: %s | الكمية: %s | الإجمالي: <b>%s</b> %s | %s\n%s"
-                     % (x["invoice_num"] if x["invoice_num"] is not None else "-", esc(x["customer_name"]),
-                        x["customer_phone"] or 0, esc(x["product_name"]), fmt_num(x["quantity"]),
-                        fmt_num(x["total_amt"]), u, fmt_dt(x["d_date"]), SEP))
-    if len(rows) > 15:
-        lines.append("… (يوجد نتائج أكثر، حدّد البحث)")
-    btns = [[("🖨️ فاتورة %s" % x["invoice_num"], "inv:%s:%s" % (kind, x["invoice_num"]))]
-            for x in rows[:5] if x["invoice_num"] is not None]
-    ctx.send("\n".join(lines), kb(*(btns + [[("🔁 بحث آخر", "rp:7:%s" % kind), ("↩️ رجوع", "rp:7")]])))
-
-
-def _sold_sql():
-    parts = []
-    for table, col in (("cash_sales", "sale_date"), ("network_sales", "sale_date"), ("shop_debts", "debt_date")):
-        parts.append("SELECT product_name, quantity AS month_qty, CASE WHEN TRUNC(%s) = TRUNC(SYSDATE) "
-                     "THEN quantity ELSE 0 END AS today_qty FROM %s WHERE client_num = :p_cn AND %s"
-                     % (col, table, _cond(col, "month")))
-    return ("SELECT product_name, SUM(month_qty) AS total_month, SUM(today_qty) AS total_today FROM ("
-            + " UNION ALL ".join(parts) + ") GROUP BY product_name")
-
-
-def sec_movement(ctx, r):
-    cn = ctx.client["num"]
-    page = _page_arg(r, 1) if r and r[0] == "p" else 0
-    u = _u(ctx)
-    header = None
-    if page == 0:
-        top = db.one("SELECT * FROM (" + _sold_sql() + " ORDER BY total_month DESC) WHERE ROWNUM = 1", p_cn=cn)
-        if top:
-            header = ("🌟 <b>المنتج الأكثر مبيعاً:</b> %s\n   - بيع منه هذا الشهر: %s حبة\n   - بيع منه اليوم: %s حبة"
-                      % (esc(top["product_name"]), fmt_num(top["total_month"]), fmt_num(top["total_today"])))
-        else:
-            header = "🌟 المنتج الأكثر مبيعاً: لا توجد مبيعات مسجلة هذا الشهر."
-    rows = db.rows(page_sql(
-        "SELECT p.product_name AS pname, NVL(p.purchase_price, 0) AS pp, NVL(p.price, 0) AS sp, "
-        "(NVL(p.price, 0) - NVL(p.purchase_price, 0)) AS prof, NVL(p.quantity, 0) AS stock_qty, "
-        "NVL(p.units_per_carton, 1) AS ucarton, NVL(s.total_today, 0) AS today_sold, "
-        "NVL(s.total_month, 0) AS month_sold FROM products_table p LEFT JOIN (" + _sold_sql() + ") s "
-        "ON p.product_name = s.product_name ORDER BY p.product_name", page, 6), p_cn=cn)
-    has_next = len(rows) > 6
-    lines = []
-    for x in rows[:6]:
-        uc = int(x["ucarton"] or 1) or 1
-        stock = int(x["stock_qty"])
-        lines.append("📦 <b>%s</b>\n💵 الشراء: %s | 💰 البيع: %s | 📈 الربح: %s %s\n"
-                     "📊 بيع اليوم: %s حبة | الشهر: %s حبة\n🏢 المتبقي: %s كرتون و %s حبة (إجمالي %s)"
-                     % (esc(x["pname"]), fmt_num(x["pp"]), fmt_num(x["sp"]), fmt_num(x["prof"]), u,
-                        fmt_num(x["today_sold"]), fmt_num(x["month_sold"]),
-                        stock // uc if stock >= 0 else 0, stock % uc if stock >= 0 else stock, fmt_num(stock)))
-    if not rows and page == 0:
-        lines = ["⚠️ لم يتم العثور على أي منتجات في قاعدة البيانات."]
-    show_page(ctx, "===== 📦 تقرير حركة المنتجات والأرباح الشامل =====", lines, page, has_next, "rp:8:p", "rp:menu", header)
-
-
-SECTIONS = {"1": sec_products, "2": sec_customers, "3": sec_sales, "4": sec_profits,
-            "5": sec_debts, "6": sec_modify, "7": sec_search, "8": sec_movement}
-'''
-
-# ════════════════════ admin.py ════════════════════
-SOURCES['admin'] = r'''"""لوحة الإدارة الشاملة — تحكم كامل بالبوت (للمدراء فقط: ADMIN_IDS).
-
-الميزات:
-  - مراجعة الطلبات (قبول/رفض)
-  - تفعيل/تمديد يدوي (بالدقيقة/الساعة/اليوم/الشهر)
-  - تعديل شامل لبيانات المستخدم (الاسم، رقم الدخول، اسم المتجر، النشاط، العملة، الموقع، الإيميل، الباسورد)
-  - حذف مستخدم/تصفير حساب/إيقاف/تفعيل
-  - إدارة طلبات التجديد، الأسعار، أسعار الصرف
-  - إحصائيات شاملة
-"""
-from __future__ import annotations
-
-import logging
-
-import core
-import db
-import subs
-import tg
+import core, db, subs, tg
 from config import cfg
 from core import (BACK_HOME, duration_label, esc, fmt_date, fmt_dt, fmt_num, kb, on_cb, on_state,
-                  parse_float, parse_int, store_password, duration_label)
+                  parse_float, parse_int, store_password)
 from reports import page_sql
-
 log = logging.getLogger("admin")
 HOME_BTN = ("🛡 لوحة الإدارة", "adm:home")
 
@@ -4160,69 +3316,54 @@ def _guard(ctx):
 
 @on_cb("adm")
 def cb_adm(ctx):
-    if not _guard(ctx):
-        return
+    if not _guard(ctx): return
     a = ctx.args
     act = a[0] if a else "home"
     arg = a[1] if len(a) > 1 else ""
     arg2 = a[2] if len(a) > 2 else ""
 
-    if act == "home":
-        home(ctx)
-    # ── الطلبات ──
-    elif act == "pend":
-        pending(ctx)
-    elif act == "ok" and arg.isdigit():
-        decide(ctx, int(arg), True)
-    elif act == "no" and arg.isdigit():
-        decide(ctx, int(arg), False)
-    # ── المستخدمون ──
-    elif act == "subs":
-        subscribers(ctx, int(arg) if arg.isdigit() else 0)
-    elif act == "c" and arg.isdigit():
-        client_detail(ctx, int(arg))
-    # ── التمديد ──
+    if act == "home": home(ctx)
+    elif act == "pend": pending(ctx)
+    elif act == "ok" and arg.isdigit(): decide(ctx, int(arg), True)
+    elif act == "no" and arg.isdigit(): decide(ctx, int(arg), False)
+    elif act == "subs": subscribers(ctx, int(arg) if arg.isdigit() else 0)
+    elif act == "c" and arg.isdigit(): client_detail(ctx, int(arg))
     elif act == "act":
         ctx.go("adm:num", adm_action="extend")
         ctx.reply("أدخل <b>رقم العميل</b>:", kb([HOME_BTN]))
-    elif act == "ext" and arg.isdigit():
-        ask_extend_type(ctx, int(arg))
+    elif act == "ext" and arg.isdigit(): ask_extend_type(ctx, int(arg))
     elif act == "extm" and arg.isdigit():
-        # minutes / hours / days / months flow
         ctx.go("adm:ext_amount", adm_num=int(arg), adm_unit=arg2)
         unit_label = {"minutes": "دقيقة", "hours": "ساعة", "days": "يوم", "months": "شهر"}.get(arg2, "وحدة")
-        ctx.reply("أدخل عدد <b>%s</b> للإضافة:" % unit_label, kb([HOME_BTN]))
-    elif act == "edit" and arg.isdigit():
-        client_edit_menu(ctx, int(arg))
-    elif act == "editf" and arg.isdigit():
-        _edit_field(ctx, int(arg), arg2)
-    elif act == "toggle" and arg.isdigit():
-        toggle(ctx, int(arg))
-    elif act == "del" and arg.isdigit():
-        _confirm_delete(ctx, int(arg))
-    elif act == "delyes" and arg.isdigit():
-        _do_delete(ctx, int(arg))
-    elif act == "reset" and arg.isdigit():
-        _confirm_reset(ctx, int(arg))
-    elif act == "resetyes" and arg.isdigit():
-        _do_reset(ctx, int(arg))
+        ctx.reply("أدخل عدد <b>%s</b>:" % unit_label, kb([HOME_BTN]))
+    elif act == "edit" and arg.isdigit(): client_edit_menu(ctx, int(arg))
+    elif act == "editf" and arg.isdigit(): _edit_field(ctx, int(arg), arg2)
+    elif act == "toggle" and arg.isdigit(): toggle(ctx, int(arg))
+    elif act == "del" and arg.isdigit(): _confirm_delete(ctx, int(arg))
+    elif act == "delyes" and arg.isdigit(): _do_delete(ctx, int(arg))
+    elif act == "reset" and arg.isdigit(): _confirm_reset(ctx, int(arg))
+    elif act == "resetyes" and arg.isdigit(): _do_reset(ctx, int(arg))
     elif act == "broadcast":
         ctx.go("adm:broadcast")
         ctx.reply("أدخل رسالة لإرسالها لكل المشتركين:", kb([HOME_BTN]))
-    # ── الأسعار ──
     elif act == "price":
         ctx.go("adm:price")
-        ctx.reply("💰 سعر الشهر الحالي: <b>%s</b> %s\nأدخل السعر الجديد (رقم صحيح):"
+        ctx.reply("💰 سعر الشهر: <b>%s</b> %s\nأدخل السعر الجديد:"
                   % (fmt_num(subs.month_price()), cfg.SUB_PRICE_UNIT), kb([HOME_BTN]))
     elif act == "rates":
         usd, sar = _rates()
         ctx.go("adm:usd")
-        ctx.reply("💱 الأسعار الحالية: الدولار = %s | السعودي = %s\n\nأدخل سعر <b>الدولار</b> الجديد:"
+        ctx.reply("💱 الدولار = %s | السعودي = %s\n\nأدخل سعر <b>الدولار</b>:"
                   % (fmt_num(usd), fmt_num(sar)), kb([HOME_BTN]))
-    elif act == "stats":
-        _stats(ctx)
-    else:
-        home(ctx)
+    elif act == "stats": _stats(ctx)
+    elif act == "newuser":
+        ctx.go("adm:newuser_tgid")
+        ctx.reply("➕ <b>إنشاء حساب لمستخدم</b>\n\n"
+                  "أدخل <b>رقم تلجرام</b> للمستخدم (من زر «🆔 رقم حسابي»):\n"
+                  "<i>أو أرسل 0 لإنشاء حساب بدون ربط.</i>", kb([HOME_BTN]))
+    elif act == "addacct" and arg.isdigit(): _add_account_to_user(ctx, int(arg))
+    elif act == "usraccts" and arg.isdigit(): _show_tg_accounts(ctx, int(arg))
+    else: home(ctx)
 
 
 def _rates():
@@ -4238,37 +3379,34 @@ def home(ctx):
                   "AND datetime('now','localtime','+7 days')", 0)
     expired = db.val("SELECT COUNT(*) FROM clients_table WHERE expiry_date < datetime('now','localtime')", 0)
     blocked = db.val("SELECT COUNT(*) FROM clients_table WHERE is_active = 0", 0)
+    tg_users = db.val("SELECT COUNT(*) FROM bot_user_accounts", 0)
     ctx.reply("🛡 <b>لوحة الإدارة الشاملة</b>\n\n"
-              "📥 طلبات تجديد معلّقة: <b>%s</b>\n"
-              "👥 إجمالي المشتركين: %s\n"
-              "⏰ ينتهي خلال 7 أيام: %s\n"
-              "⛔ منتهي: %s | موقوف: %s\n"
-              "💰 سعر الشهر: %s %s"
-              % (pend, total, soon, expired, blocked, fmt_num(subs.month_price()), cfg.SUB_PRICE_UNIT),
-              kb([("📥 الطلبات المعلّقة (%s)" % pend, "adm:pend")],
-                 [("👥 المشتركون", "adm:subs:0"), ("➕ تفعيل/تمديد يدوي", "adm:act")],
+              "📥 طلبات معلّقة: <b>%s</b>\n👥 المشتركون: %s\n📱 ارتباطات تلجرام: %s\n"
+              "⏰ خلال 7 أيام: %s\n⛔ منتهي: %s | موقوف: %s\n💰 سعر الشهر: %s %s"
+              % (pend, total, tg_users, soon, expired, blocked,
+                 fmt_num(subs.month_price()), cfg.SUB_PRICE_UNIT),
+              kb([("📥 الطلبات (%s)" % pend, "adm:pend")],
+                 [("👥 المشتركون", "adm:subs:0"), ("➕ تمديد يدوي", "adm:act")],
+                 [("🆕 إنشاء حساب جديد", "adm:newuser")],
                  [("💰 سعر الشهر", "adm:price"), ("💱 أسعار الصرف", "adm:rates")],
-                 [("📊 إحصائيات شاملة", "adm:stats")],
+                 [("📊 إحصائيات", "adm:stats")],
                  [("📢 رسالة جماعية", "adm:broadcast")],
                  [BACK_HOME]))
 
 
-# ── الطلبات ──
 def pending(ctx):
     rows = db.rows("SELECT * FROM (SELECT r.req_id, r.months, r.amount, r.created_at, c.name, c.num "
                    "FROM bot_sub_requests r JOIN clients_table c ON c.num = r.client_num "
                    "WHERE r.status = 'PENDING' ORDER BY r.req_id) WHERE ROWNUM <= 10")
     if not rows:
-        ctx.reply("لا توجد طلبات تجديد معلّقة ✅", kb([HOME_BTN]))
-        return
-    lines = ["📥 <b>طلبات التجديد المعلّقة</b>", ""]
-    btns = []
+        ctx.reply("لا طلبات معلّقة ✅", kb([HOME_BTN])); return
+    lines = ["📥 <b>الطلبات المعلّقة</b>", ""]; btns = []
     for r in rows:
-        lines.append("#%s • %s (رقم %s) • %s • %s %s\n    %s" % (
-            r["req_id"], esc(r["name"]), r["num"], duration_label(r["months"]), fmt_num(r["amount"]),
-            cfg.SUB_PRICE_UNIT, core.fmt_dt(r["created_at"])))
-        btns.append([("✅ تفعيل #%s" % r["req_id"], "adm:ok:%s" % r["req_id"]),
-                     ("❌ رفض #%s" % r["req_id"], "adm:no:%s" % r["req_id"])])
+        lines.append("#%s • %s (رقم %s) • %s • %s %s\n    %s"
+                     % (r["req_id"], esc(r["name"]), r["num"], duration_label(r["months"]),
+                        fmt_num(r["amount"]), cfg.SUB_PRICE_UNIT, core.fmt_dt(r["created_at"])))
+        btns.append([("✅ #%s" % r["req_id"], "adm:ok:%s" % r["req_id"]),
+                     ("❌ #%s" % r["req_id"], "adm:no:%s" % r["req_id"])])
     btns.append([HOME_BTN])
     ctx.reply("\n".join(lines), kb(*btns))
 
@@ -4277,46 +3415,35 @@ def decide(ctx, rid, ok):
     try:
         req, res = (subs.approve_request if ok else subs.reject_request)(ctx, rid)
     except ValueError as e:
-        ctx.reply("⚠️ %s" % esc(e), kb([HOME_BTN]))
-        return
+        ctx.reply("⚠️ %s" % esc(e), kb([HOME_BTN])); return
     if not req:
-        ctx.reply("⚠️ %s" % esc(res), kb([("📥 الطلبات", "adm:pend"), HOME_BTN]))
-        return
+        ctx.reply("⚠️ %s" % esc(res), kb([("📥 الطلبات", "adm:pend"), HOME_BTN])); return
     if ok:
-        ctx.reply("✅ تم تفعيل الطلب <b>#%s</b> (العميل رقم %s).\nينتهي الاشتراك في: <b>%s</b>"
-                  % (rid, req["client_num"], fmt_date(res)),
-                  kb([("📥 الطلبات", "adm:pend"), HOME_BTN]))
+        ctx.reply("✅ تم تفعيل #%s (العميل %s).\nينتهي: <b>%s</b>"
+                  % (rid, req["client_num"], fmt_date(res)), kb([("📥 الطلبات", "adm:pend"), HOME_BTN]))
     else:
-        ctx.reply("❌ تم رفض الطلب <b>#%s</b>." % rid, kb([("📥 الطلبات", "adm:pend"), HOME_BTN]))
+        ctx.reply("❌ رُفض #%s." % rid, kb([("📥 الطلبات", "adm:pend"), HOME_BTN]))
 
 
-# ── المشتركون ──
 def subscribers(ctx, page):
     rows = db.rows(page_sql("SELECT num, name, shop_name, expiry_date, "
                             "(julianday(expiry_date) - julianday('now', 'localtime')) AS days_left, "
                             "is_active FROM clients_table ORDER BY expiry_date", page, 8))
     has_next = len(rows) > 8
-    lines = ["👥 <b>المشتركون</b>", ""]
-    btns = []
+    lines = ["👥 <b>المشتركون</b>", ""]; btns = []
     for r in rows[:8]:
         dl = r["days_left"]
-        if r["is_active"] is not None and int(r["is_active"]) == 0:
-            st = "⛔ موقوف"
-        elif dl is not None and dl < 0:
-            st = "❌ منتهي"
-        else:
-            st = "✅ %s يوم" % ("∞" if dl is None else int(dl))
+        if r["is_active"] is not None and int(r["is_active"]) == 0: st = "⛔ موقوف"
+        elif dl is not None and dl < 0: st = "❌ منتهي"
+        else: st = "✅ %s يوم" % ("∞" if dl is None else int(dl))
         lines.append("<b>%s</b> (رقم %s) — %s — ينتهي %s" % (esc(r["name"]), r["num"], st, fmt_date(r["expiry_date"])))
         btns.append([("👤 %s (%s)" % ((r["name"] or "")[:22], r["num"]), "adm:c:%s" % r["num"])])
-    if not rows:
-        lines.append("لا يوجد مشتركون.")
+    if not rows: lines.append("لا مشتركون.")
     nav = []
-    if page > 0:
-        nav.append(("◀️ السابق", "adm:subs:%d" % (page - 1)))
-    if has_next:
-        nav.append(("التالي ▶️", "adm:subs:%d" % (page + 1)))
-    if nav:
-        btns.append(nav)
+    if page > 0: nav.append(("◀️ السابق", "adm:subs:%d" % (page - 1)))
+    if has_next: nav.append(("التالي ▶️", "adm:subs:%d" % (page + 1)))
+    if nav: btns.append(nav)
+    btns.append([("🆕 إنشاء حساب", "adm:newuser")])
     btns.append([HOME_BTN])
     ctx.reply("\n".join(lines), kb(*btns))
 
@@ -4324,47 +3451,47 @@ def subscribers(ctx, page):
 def client_detail(ctx, num):
     c = core.fetch_client(num)
     if not c:
-        ctx.reply("⚠️ العميل غير موجود.", kb([("👥 المشتركون", "adm:subs:0"), HOME_BTN]))
-        return
+        ctx.reply("⚠️ غير موجود.", kb([("👥 المشتركون", "adm:subs:0"), HOME_BTN])); return
     st = subs.status(c)
     state = "⛔ موقوف" if st["blocked"] else ("❌ منتهي" if st["expired"] else "✅ ساري")
+    links = db.rows("SELECT telegram_id, added_at FROM bot_user_accounts WHERE client_num = :n", n=num)
+    tg_line = "\n📱 مرتبط بـ %d حساب تلجرام" % len(links) if links else "\n📱 غير مرتبط بأي حساب تلجرام"
     ctx.reply("👤 <b>%s</b> (رقم %s)\nالايميل: %s\nالمحل: %s\nنوع الحساب: %s\n"
-              "بدأ: %s\nينتهي: <b>%s</b> (%s)\nالمدة المسجلة: %s شهر\nإجمالي المدفوع: %s %s"
+              "بدأ: %s\nينتهي: <b>%s</b> (%s)\nالمدة: %s شهر | مدفوع: %s %s%s"
               % (esc(c["name"]), c["num"], esc(c["email"]), esc(c.get("shop_name") or "-"),
                  esc(c.get("account_type") or "غير محدد"), fmt_date(c.get("start_date")),
                  fmt_date(c.get("expiry_date")), state, c.get("subscription_months") or 0,
-                 fmt_num(c.get("money") or 0), cfg.SUB_PRICE_UNIT),
+                 fmt_num(c.get("money") or 0), cfg.SUB_PRICE_UNIT, tg_line),
               kb([("➕ تمديد / تجديد", "adm:ext:%s" % num)],
-                 [("✏️ تعديل بيانات المستخدم", "adm:edit:%s" % num)],
-                 [("✅ تفعيل الحساب" if st["blocked"] else "⛔ إيقاف الحساب", "adm:toggle:%s" % num)],
-                 [("🔄 تصفير الحساب", "adm:reset:%s" % num)],
-                 [("🗑 حذف المستخدم", "adm:del:%s" % num)],
+                 [("✏️ تعديل البيانات", "adm:edit:%s" % num)],
+                 [("➕ إضافة حساب إضافي", "adm:addacct:%s" % num)],
+                 [("✅ تفعيل" if st["blocked"] else "⛔ إيقاف", "adm:toggle:%s" % num)],
+                 [("🔄 تصفير", "adm:reset:%s" % num)],
+                 [("🗑 حذف", "adm:del:%s" % num)],
                  [("👥 المشتركون", "adm:subs:0"), HOME_BTN]))
 
 
 def toggle(ctx, num):
     c = core.fetch_client(num)
     if not c:
-        ctx.reply("⚠️ العميل غير موجود.", kb([HOME_BTN]))
-        return
+        ctx.reply("⚠️ غير موجود.", kb([HOME_BTN])); return
     blocked = subs.status(c)["blocked"]
     db.run("UPDATE clients_table SET is_active = :p_v WHERE num = :p_n", p_v=1 if blocked else 0, p_n=num)
     core.audit("ACCOUNT_TOGGLE", ctx, client_num=num, details="active=%s" % (1 if blocked else 0))
     if blocked:
-        subs.notify_client(num, "✅ تم تفعيل حسابك من قبل الإدارة.", kb([BACK_HOME]))
+        subs.notify_client(num, "✅ تم تفعيل حسابك.", kb([BACK_HOME]))
     else:
-        subs.notify_client(num, "⛔ تم إيقاف حسابك من قبل الإدارة. للاستفسار تواصل مع الإدارة.", kb([BACK_HOME]))
+        subs.notify_client(num, "⛔ تم إيقاف حسابك. للاستفسار تواصل مع الإدارة.",
+                           kb([("📞 تواصل معنا", "support:home"), BACK_HOME]))
     client_detail(ctx, num)
 
 
-# ── التمديد الدقيق ──
 def ask_extend_type(ctx, num):
     c = core.fetch_client(num)
     if not c:
-        ctx.reply("⚠️ العميل غير موجود.", kb([HOME_BTN]))
-        return
+        ctx.reply("⚠️ غير موجود.", kb([HOME_BTN])); return
     ctx.go(None)
-    ctx.reply("➕ <b>تمديد اشتراك</b>\nالعميل: %s (رقم %s)\nينتهي حالياً: %s\n\nاختر الوحدة:"
+    ctx.reply("➕ <b>تمديد</b>\nالعميل: %s (رقم %s)\nينتهي: %s\n\nاختر:"
               % (esc(c["name"]), num, fmt_date(c.get("expiry_date"))),
               kb([("📅 شهر", "adm:extm:%s:months" % num), ("📆 يوم", "adm:extm:%s:days" % num)],
                  [("⏰ ساعة", "adm:extm:%s:hours" % num), ("⏱ دقيقة", "adm:extm:%s:minutes" % num)],
@@ -4374,55 +3501,39 @@ def ask_extend_type(ctx, num):
 @on_state("adm:num")
 def st_adm_num(ctx):
     n = parse_int(ctx.text, 1, 2147483647)
-    if n is None:
-        ctx.send("أدخل رقم العميل (أرقام فقط):")
-        return
+    if n is None: ctx.send("أدخل رقم العميل:"); return
     if not core.fetch_client(n):
-        ctx.send("⚠️ لا يوجد عميل بهذا الرقم. أعد المحاولة:", kb([HOME_BTN]))
-        return
+        ctx.send("⚠️ غير موجود. أعد المحاولة:", kb([HOME_BTN])); return
     ask_extend_type(ctx, n)
 
 
 @on_state("adm:ext_amount")
 def st_adm_ext_amount(ctx):
-    d = ctx.data
-    num, unit = d.get("adm_num"), d.get("adm_unit")
+    d = ctx.data; num, unit = d.get("adm_num"), d.get("adm_unit")
     if not num or unit not in ("minutes", "hours", "days", "months"):
-        ctx.reset()
-        ctx.send("انتهت الجلسة.", kb([HOME_BTN]))
-        return
+        ctx.reset(); ctx.send("انتهت.", kb([HOME_BTN])); return
     v = parse_int(ctx.text, 1, 100000)
-    if v is None:
-        ctx.send("أدخل عدداً صحيحاً أكبر من صفر:")
-        return
-    kwargs = {unit: v}
+    if v is None: ctx.send("أدخل عدداً:"); return
     try:
         with db.tx() as t:
-            exp = subs.grant_precise(t, num, amount=0, **kwargs)
-            core.audit("SUB_MANUAL_PRECISE", ctx, client_num=num,
-                       details="+%s %s" % (v, unit), t=t)
+            exp = subs.grant_precise(t, num, amount=0, **{unit: v})
+            core.audit("SUB_MANUAL_PRECISE", ctx, client_num=num, details="+%s %s" % (v, unit), t=t)
     except ValueError as e:
-        ctx.reset()
-        ctx.send("⚠️ %s" % esc(e), kb([HOME_BTN]))
-        return
+        ctx.reset(); ctx.send("⚠️ %s" % esc(e), kb([HOME_BTN])); return
     ctx.reset()
     unit_ar = {"minutes": "دقيقة", "hours": "ساعة", "days": "يوم", "months": "شهر"}[unit]
-    subs.notify_client(num, "✅ تم تمديد اشتراكك بـ <b>%s %s</b>.\nينتهي في: <b>%s</b>"
+    subs.notify_client(num, "✅ تمديد اشتراكك بـ <b>%s %s</b>.\nينتهي: <b>%s</b>"
                        % (v, unit_ar, fmt_date(exp)), kb([BACK_HOME]))
-    ctx.send("✅ تم تمديد اشتراك العميل %s بـ %s %s.\nينتهي في: <b>%s</b>"
-             % (num, v, unit_ar, fmt_date(exp)),
-             kb([("👤 تفاصيل العميل", "adm:c:%s" % num), HOME_BTN]))
+    ctx.send("✅ تمديد %s بـ %s %s.\nينتهي: <b>%s</b>" % (num, v, unit_ar, fmt_date(exp)),
+             kb([("👤 تفاصيل", "adm:c:%s" % num), HOME_BTN]))
 
 
-# ── تعديل بيانات المستخدم ──
 def client_edit_menu(ctx, num):
     c = core.fetch_client(num)
     if not c:
-        ctx.reply("⚠️ العميل غير موجود.", kb([HOME_BTN]))
-        return
+        ctx.reply("⚠️ غير موجود.", kb([HOME_BTN])); return
     ctx.go(None)
-    ctx.reply("✏️ <b>تعديل بيانات المستخدم</b>\nالعميل: %s (رقم %s)\n\nاختر الحقل:"
-              % (esc(c["name"]), num),
+    ctx.reply("✏️ <b>تعديل البيانات</b>\nالعميل: %s (رقم %s)\n\nاختر الحقل:" % (esc(c["name"]), num),
               kb([("👤 الاسم", "adm:editf:%s:name" % num), ("🔢 رقم الدخول", "adm:editf:%s:num" % num)],
                  [("📧 الإيميل", "adm:editf:%s:email" % num), ("🏪 اسم المتجر", "adm:editf:%s:shop_name" % num)],
                  [("🏷 النشاط", "adm:editf:%s:activity_type" % num), ("🌍 الدولة", "adm:editf:%s:shop_location" % num)],
@@ -4431,150 +3542,281 @@ def client_edit_menu(ctx, num):
                  [("↩️ رجوع", "adm:c:%s" % num), HOME_BTN]))
 
 
-_EDIT_LABELS = {
-    "name": "الاسم", "num": "رقم الدخول", "email": "الإيميل",
-    "shop_name": "اسم المتجر", "activity_type": "النشاط",
-    "shop_location": "الدولة", "location": "الموقع", "currency": "العملة",
-    "password_hash": "كلمة المرور",
-}
+_EDIT_LABELS = {"name": "الاسم", "num": "رقم الدخول", "email": "الإيميل",
+                "shop_name": "اسم المتجر", "activity_type": "النشاط",
+                "shop_location": "الدولة", "location": "الموقع", "currency": "العملة",
+                "password_hash": "كلمة المرور"}
 
 
 def _edit_field(ctx, num, field):
     if field not in _EDIT_LABELS:
-        ctx.reply("حقل غير معروف.", kb([HOME_BTN]))
-        return
+        ctx.reply("حقل غير معروف.", kb([HOME_BTN])); return
     ctx.go("adm:editval", adm_num=num, adm_field=field)
-    ctx.reply("أدخل القيمة الجديدة لـ <b>%s</b>:" % _EDIT_LABELS[field], kb([HOME_BTN]))
+    ctx.reply("أدخل <b>%s</b> الجديد:" % _EDIT_LABELS[field], kb([HOME_BTN]))
 
 
 @on_state("adm:editval")
 def st_adm_editval(ctx):
     num, field = ctx.data.get("adm_num"), ctx.data.get("adm_field")
     if not num or field not in _EDIT_LABELS:
-        ctx.reset()
-        ctx.send("انتهت الجلسة.", kb([HOME_BTN]))
-        return
+        ctx.reset(); ctx.send("انتهت.", kb([HOME_BTN])); return
     raw = ctx.text or ""
     if field == "num":
         v = parse_int(raw, 1, 2147483647)
-        if v is None:
-            ctx.send("أدخل رقماً صحيحاً:")
-            return
+        if v is None: ctx.send("أدخل رقماً:"); return
         if v != num and db.one("SELECT num FROM clients_table WHERE num = :p_n", p_n=v):
-            ctx.send("⚠️ هذا الرقم مستخدم. أدخل رقماً آخر:")
-            return
+            ctx.send("⚠️ مستخدم. أدخل رقماً آخر:"); return
         db.run("UPDATE clients_table SET num = :p_v WHERE num = :p_n", p_v=v, p_n=num)
         db.run("UPDATE bot_users SET client_num = :p_v WHERE client_num = :p_n", p_v=v, p_n=num)
+        db.run("UPDATE bot_user_accounts SET client_num = :p_v WHERE client_num = :p_n", p_v=v, p_n=num)
         core.audit("ADMIN_EDIT_NUM", ctx, client_num=v, details="old=%s new=%s" % (num, v))
         ctx.reset()
-        ctx.send("✅ تم تحديث رقم الدخول من %s إلى %s" % (num, v),
-                 kb([("👤 تفاصيل العميل", "adm:c:%s" % v), HOME_BTN]))
-        return
+        ctx.send("✅ تم تحديث رقم الدخول: %s → %s" % (num, v),
+                 kb([("👤 تفاصيل", "adm:c:%s" % v), HOME_BTN])); return
     if field == "password_hash":
-        if len(raw) < 8:
-            ctx.send("كلمة المرور يجب أن تكون 8 أحرف على الأقل:")
-            return
+        if len(raw) < 8: ctx.send("8 أحرف على الأقل:"); return
         v = store_password(raw)
     elif field == "email":
         v = core.clean_text(raw, 150)
-        if not v or "@" not in v:
-            ctx.send("إيميل غير صحيح:")
-            return
-    else:
-        v = core.clean_text(raw, 100, True)
+        if not v or "@" not in v: ctx.send("إيميل غير صحيح:"); return
+    else: v = core.clean_text(raw, 100, True)
     db.run("UPDATE clients_table SET %s = :p_v WHERE num = :p_n" % field, p_v=v, p_n=num)
-    core.audit("ADMIN_EDIT", ctx, client_num=num, details="%s=%s" % (field, v if field != "password_hash" else "***"))
+    core.audit("ADMIN_EDIT", ctx, client_num=num, details="%s=%s" % (field, "***" if field == "password_hash" else v))
     ctx.reset()
     ctx.send("✅ تم تحديث <b>%s</b> للعميل %s" % (_EDIT_LABELS[field], num),
-             kb([("✏️ تعديل حقل آخر", "adm:edit:%s" % num)], [("👤 تفاصيل العميل", "adm:c:%s" % num), HOME_BTN]))
+             kb([("✏️ تعديل آخر", "adm:edit:%s" % num)], [("👤 تفاصيل", "adm:c:%s" % num), HOME_BTN]))
 
 
-# ── حذف/تصفير ──
 def _confirm_delete(ctx, num):
     c = core.fetch_client(num)
     if not c:
-        ctx.reply("⚠️ العميل غير موجود.", kb([HOME_BTN]))
-        return
-    ctx.reply("⚠️ <b>تأكيد الحذف النهائي</b>\nهل أنت متأكد من حذف المستخدم <b>%s</b> (رقم %s)؟\n"
-              "سيتم حذف كل بياناته نهائياً (لا يمكن التراجع)."
+        ctx.reply("⚠️ غير موجود.", kb([HOME_BTN])); return
+    ctx.reply("⚠️ <b>حذف نهائي</b>\nحذف <b>%s</b> (رقم %s)؟\nكل بياناته ستُحذف نهائياً."
               % (esc(c["name"]), num),
-              kb([("🗑 نعم، احذف نهائياً", "adm:delyes:%s" % num)],
-                 [("❌ إلغاء", "adm:c:%s" % num), HOME_BTN]))
+              kb([("🗑 نعم، احذف", "adm:delyes:%s" % num)], [("❌ إلغاء", "adm:c:%s" % num), HOME_BTN]))
 
 
 def _do_delete(ctx, num):
     with db.tx() as t:
+        for tbl in ("bot_user_accounts", "personal_expenses", "personal_income", "personal_debt_payments",
+                    "personal_debts", "personal_notes", "personal_goals", "personal_obligations",
+                    "shop_customers", "shop_debts", "cash_sales", "network_sales", "imports_table",
+                    "bot_sub_requests"):
+            t.run("DELETE FROM %s WHERE client_num = :n" % tbl, n=num)
         t.run("UPDATE bot_users SET client_num = NULL, state = NULL, state_data = NULL WHERE client_num = :c", c=num)
         t.run("DELETE FROM clients_table WHERE num = :n", n=num)
-        t.run("DELETE FROM personal_expenses WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_income WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_debt_payments WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_debts WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_notes WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_goals WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_obligations WHERE client_num = :n", n=num)
-        t.run("DELETE FROM shop_customers WHERE client_num = :n", n=num)
-        t.run("DELETE FROM shop_debts WHERE client_num = :n", n=num)
-        t.run("DELETE FROM cash_sales WHERE client_num = :n", n=num)
-        t.run("DELETE FROM network_sales WHERE client_num = :n", n=num)
-        t.run("DELETE FROM imports_table WHERE client_num = :n", n=num)
-        t.run("DELETE FROM bot_sub_requests WHERE client_num = :n", n=num)
         core.audit("ADMIN_DELETE_USER", ctx, client_num=num, t=t)
     ctx.reset()
-    ctx.reply("✅ تم حذف المستخدم %s وكل بياناته." % num,
-              kb([("👥 المشتركون", "adm:subs:0"), HOME_BTN]))
+    ctx.reply("✅ تم حذف المستخدم %s وكل بياناته." % num, kb([("👥 المشتركون", "adm:subs:0"), HOME_BTN]))
 
 
 def _confirm_reset(ctx, num):
     c = core.fetch_client(num)
     if not c:
-        ctx.reply("⚠️ العميل غير موجود.", kb([HOME_BTN]))
-        return
-    ctx.reply("🔄 <b>تصفير الحساب</b>\nسيتم حذف كل بيانات المستخدم (<b>%s</b>) من المتجر والديون والمبيعات والشخصية،\n"
-              "لكن سيبقى الحساب الأساسي والاشتراك كما هو.\n\nتأكيد؟" % esc(c["name"]),
-              kb([("🔄 نعم، صفّر", "adm:resetyes:%s" % num)],
-                 [("❌ إلغاء", "adm:c:%s" % num), HOME_BTN]))
+        ctx.reply("⚠️ غير موجود.", kb([HOME_BTN])); return
+    ctx.reply("🔄 <b>تصفير البيانات</b>\nحذف بيانات المتجر والديون والشخصية لـ <b>%s</b> مع بقاء الحساب والاشتراك.\nتأكيد؟"
+              % esc(c["name"]),
+              kb([("🔄 نعم، صفّر", "adm:resetyes:%s" % num)], [("❌ إلغاء", "adm:c:%s" % num), HOME_BTN]))
 
 
 def _do_reset(ctx, num):
     with db.tx() as t:
-        t.run("DELETE FROM personal_expenses WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_income WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_debt_payments WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_debts WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_notes WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_goals WHERE client_num = :n", n=num)
-        t.run("DELETE FROM personal_obligations WHERE client_num = :n", n=num)
-        t.run("DELETE FROM shop_customers WHERE client_num = :n", n=num)
-        t.run("DELETE FROM shop_debts WHERE client_num = :n", n=num)
-        t.run("DELETE FROM cash_sales WHERE client_num = :n", n=num)
-        t.run("DELETE FROM network_sales WHERE client_num = :n", n=num)
-        t.run("DELETE FROM imports_table WHERE client_num = :n", n=num)
+        for tbl in ("personal_expenses", "personal_income", "personal_debt_payments", "personal_debts",
+                    "personal_notes", "personal_goals", "personal_obligations", "shop_customers",
+                    "shop_debts", "cash_sales", "network_sales", "imports_table"):
+            t.run("DELETE FROM %s WHERE client_num = :n" % tbl, n=num)
         core.audit("ADMIN_RESET_USER", ctx, client_num=num, t=t)
     ctx.reset()
-    ctx.reply("✅ تم تصفير بيانات المستخدم %s (مع بقاء الحساب والاشتراك)." % num,
-              kb([("👤 تفاصيل العميل", "adm:c:%s" % num), HOME_BTN]))
+    ctx.reply("✅ تم تصفير بيانات المستخدم %s." % num, kb([("👤 تفاصيل", "adm:c:%s" % num), HOME_BTN]))
 
 
-# ── رسالة جماعية ──
+# ─────────── إنشاء مستخدم جديد ───────────
+@on_state("adm:newuser_tgid")
+def st_newuser_tgid(ctx):
+    raw = (ctx.text or "").strip()
+    if raw == "0":
+        ctx.go("adm:newuser_name", adm_tgid=None); ctx.send("أدخل اسم المستخدم:"); return
+    tgid = parse_int(raw, 1, 10 ** 15)
+    if tgid is None:
+        ctx.send("أدخل رقم تلجرام أو 0 للتخطي:"); return
+    exists = db.one("SELECT telegram_id FROM bot_users WHERE telegram_id = :t", t=tgid)
+    if not exists:
+        ctx.send("⚠️ لا يوجد مستخدم تلجرام بهذا الرقم (يجب أن يرسل /start أولاً).\n"
+                 "أو أرسل 0 لإنشاء حساب بدون ربط:", kb([HOME_BTN])); return
+    ctx.go("adm:newuser_name", adm_tgid=tgid)
+    ctx.send("✅ تلجرام: %s\nأدخل اسم المستخدم:" % tgid)
+
+
+@on_state("adm:newuser_name")
+def st_newuser_name(ctx):
+    v = core.clean_text(ctx.text, 100, True)
+    if not v: ctx.send("أدخل الاسم:"); return
+    ctx.go("adm:newuser_num", adm_name=v); ctx.send("أدخل رقم العميل (رقم الدخول):")
+
+
+@on_state("adm:newuser_num")
+def st_newuser_num(ctx):
+    n = parse_int(ctx.text, 1, 2147483647)
+    if n is None: ctx.send("أدخل رقماً:"); return
+    if db.one("SELECT num FROM clients_table WHERE num = :n", n=n):
+        ctx.send("⚠️ مستخدم. اختر آخر:"); return
+    ctx.go("adm:newuser_email", adm_num=n); ctx.send("أدخل الإيميل:")
+
+
+@on_state("adm:newuser_email")
+def st_newuser_email(ctx):
+    e = core.clean_text(ctx.text, 150)
+    if not e or "@" not in e: ctx.send("إيميل غير صحيح:"); return
+    if db.one("SELECT num FROM clients_table WHERE LOWER(email) = :e", e=e.lower()):
+        ctx.send("⚠️ مستخدم. أدخل آخر:"); return
+    ctx.go("adm:newuser_pass", adm_email=e); ctx.send("أدخل كلمة المرور (8+):")
+
+
+@on_state("adm:newuser_pass")
+def st_newuser_pass(ctx):
+    pw = ctx.text or ""
+    ctx.delete_user_message()
+    if len(pw) < 8: ctx.send("8 أحرف على الأقل:"); return
+    ctx.go("adm:newuser_months", adm_pw=pw); ctx.send("أدخل عدد الأشهر (1-999):")
+
+
+@on_state("adm:newuser_months")
+def st_newuser_months(ctx):
+    m = parse_int(ctx.text, 1, 999)
+    if m is None: ctx.send("أدخل عدداً:"); return
+    d = ctx.data
+    try:
+        with db.tx() as t:
+            t.run("INSERT INTO clients_table (num, name, email, password_hash, subscription_months, "
+                  "subscription_duration, money) VALUES (:n, :nm, :e, :p, :m, :dur, 0)",
+                  n=d["adm_num"], nm=d["adm_name"], e=d["adm_email"],
+                  p=store_password(d["adm_pw"]), m=m, dur=duration_label(m))
+            if d.get("adm_tgid"):
+                t.run("INSERT INTO bot_user_accounts (telegram_id, client_num, added_by) "
+                      "VALUES (:t, :c, :a)", t=d["adm_tgid"], c=d["adm_num"], a=ctx.user_id)
+                t.run("UPDATE bot_users SET client_num = :c WHERE telegram_id = :t",
+                      c=d["adm_num"], t=d["adm_tgid"])
+            core.audit("ADMIN_NEW_USER", ctx, client_num=d["adm_num"],
+                       details="tgid=%s months=%s" % (d.get("adm_tgid"), m), t=t)
+    except Exception as e:
+        if "UNIQUE" in str(e) or "ORA-00001" in str(e):
+            ctx.reset()
+            ctx.send("⚠️ الرقم أو الإيميل مستخدم.", kb([("🆕 جديد", "adm:newuser"), HOME_BTN])); return
+        raise
+    num = d["adm_num"]
+    ctx.reset()
+    msg = "✅ تم إنشاء الحساب!\nرقم: %s\nاسم: %s\nمدة: %s" % (num, d["adm_name"], duration_label(m))
+    if d.get("adm_tgid"):
+        msg += "\n📱 تلجرام: %s" % d["adm_tgid"]
+        tg.send(int(d["adm_tgid"]),
+                "🎉 تم إنشاء حساب جديد لك!\n📌 رقم الدخول: <b>%s</b>\n👤 %s\n📅 المدة: %s\n\n"
+                "لتسجيل الدخول: /start ثم «تسجيل الدخول»." % (num, esc(d["adm_name"]), duration_label(m)),
+                kb([("🏠 القائمة", "m:home")]))
+    ctx.send(msg, kb([("👤 تفاصيل", "adm:c:%s" % num), ("🆕 آخر", "adm:newuser"), HOME_BTN]))
+
+
+# ─────────── إضافة حساب إضافي لمستخدم موجود ───────────
+def _add_account_to_user(ctx, client_num):
+    links = db.rows("SELECT DISTINCT telegram_id FROM bot_user_accounts WHERE client_num = :n", n=client_num)
+    if not links:
+        ctx.reply("⚠️ الحساب غير مرتبط بأي مستخدم تلجرام.", kb([("👤 تفاصيل", "adm:c:%s" % client_num), HOME_BTN]))
+        return
+    tgid = int(links[0]["telegram_id"])
+    ctx.go("adm:addacct_name", adm_tgid=tgid)
+    ctx.reply("➕ <b>إضافة حساب إضافي</b>\nالمستخدم تلجرام: <code>%s</code>\n\nأدخل اسم الحساب الجديد:" % tgid,
+              kb([HOME_BTN]))
+
+
+@on_state("adm:addacct_name")
+def st_addacct_name(ctx):
+    v = core.clean_text(ctx.text, 100, True)
+    if not v: ctx.send("أدخل الاسم:"); return
+    ctx.go("adm:addacct_num", adm_name=v); ctx.send("أدخل رقم العميل الجديد:")
+
+
+@on_state("adm:addacct_num")
+def st_addacct_num(ctx):
+    n = parse_int(ctx.text, 1, 2147483647)
+    if n is None: ctx.send("أدخل رقماً:"); return
+    if db.one("SELECT num FROM clients_table WHERE num = :n", n=n):
+        ctx.send("⚠️ مستخدم. اختر آخر:"); return
+    ctx.go("adm:addacct_email", adm_num=n); ctx.send("أدخل الإيميل:")
+
+
+@on_state("adm:addacct_email")
+def st_addacct_email(ctx):
+    e = core.clean_text(ctx.text, 150)
+    if not e or "@" not in e: ctx.send("إيميل غير صحيح:"); return
+    if db.one("SELECT num FROM clients_table WHERE LOWER(email) = :e", e=e.lower()):
+        ctx.send("⚠️ مستخدم. أدخل آخر:"); return
+    ctx.go("adm:addacct_pass", adm_email=e); ctx.send("أدخل كلمة المرور:")
+
+
+@on_state("adm:addacct_pass")
+def st_addacct_pass(ctx):
+    pw = ctx.text or ""
+    ctx.delete_user_message()
+    if len(pw) < 8: ctx.send("8 أحرف على الأقل:"); return
+    ctx.go("adm:addacct_months", adm_pw=pw); ctx.send("أدخل عدد الأشهر:")
+
+
+@on_state("adm:addacct_months")
+def st_addacct_months(ctx):
+    m = parse_int(ctx.text, 1, 999)
+    if m is None: ctx.send("أدخل عدداً:"); return
+    d = ctx.data; tgid = d["adm_tgid"]
+    try:
+        with db.tx() as t:
+            t.run("INSERT INTO clients_table (num, name, email, password_hash, subscription_months, "
+                  "subscription_duration, money) VALUES (:n, :nm, :e, :p, :m, :dur, 0)",
+                  n=d["adm_num"], nm=d["adm_name"], e=d["adm_email"],
+                  p=store_password(d["adm_pw"]), m=m, dur=duration_label(m))
+            t.run("INSERT INTO bot_user_accounts (telegram_id, client_num, added_by) "
+                  "VALUES (:t, :c, :a)", t=tgid, c=d["adm_num"], a=ctx.user_id)
+            core.audit("ADMIN_ADD_ACCOUNT", ctx, client_num=d["adm_num"],
+                       details="tgid=%s months=%s" % (tgid, m), t=t)
+    except Exception as e:
+        if "UNIQUE" in str(e) or "ORA-00001" in str(e):
+            ctx.reset()
+            ctx.send("⚠️ الرقم أو الإيميل مستخدم.", kb([("👤 تفاصيل", "adm:c:%s" % d.get("adm_num")), HOME_BTN]))
+            return
+        raise
+    num = d["adm_num"]; ctx.reset()
+    tg.send(tgid, "🎉 تم إضافة حساب جديد لك!\n📌 رقم: <b>%s</b>\n👤 %s\n📅 %s\n\n"
+                  "استخدم زر «🔄 تبديل الحساب» في القائمة الرئيسية."
+           % (num, esc(d["adm_name"]), duration_label(m)), kb([("🏠 القائمة", "m:home")]))
+    ctx.send("✅ تم إضافة الحساب %s وربطه بـ %s." % (num, tgid),
+             kb([("👤 تفاصيل", "adm:c:%s" % num), ("📱 حسابات المستخدم", "adm:usraccts:%s" % tgid), HOME_BTN]))
+
+
+def _show_tg_accounts(ctx, tgid):
+    rows = core.user_accounts(tgid)
+    if not rows:
+        ctx.reply("⚠️ لا حسابات مرتبطة.", kb([HOME_BTN])); return
+    lines = ["📱 <b>حسابات المستخدم</b> <code>%s</code>\n" % tgid]; btns = []
+    for r in rows:
+        dl = r.get("days_left")
+        st = "⛔" if (r.get("is_active") is not None and int(r["is_active"]) == 0) else (
+            "❌" if (dl is not None and dl < 0) else "✅")
+        lines.append("%s <b>%s</b> (رقم %s) — %s" % (st, esc(r["name"]), r["client_num"], fmt_date(r.get("expiry_date"))))
+        btns.append([("👤 %s (%s)" % ((r["name"] or "")[:20], r["client_num"]), "adm:c:%s" % r["client_num"])])
+    btns.append([HOME_BTN])
+    ctx.reply("\n".join(lines), kb(*btns))
+
+
 @on_state("adm:broadcast")
 def st_broadcast(ctx):
     msg = (ctx.text or "").strip()
-    if not msg:
-        ctx.send("أدخل نص الرسالة:")
-        return
-    users = db.rows("SELECT DISTINCT client_num FROM bot_users WHERE client_num IS NOT NULL")
+    if not msg: ctx.send("أدخل نص الرسالة:"); return
+    users = db.rows("SELECT DISTINCT telegram_id FROM bot_users WHERE client_num IS NOT NULL")
     sent = 0
     for u in users:
-        for tg_user in db.rows("SELECT telegram_id FROM bot_users WHERE client_num = :c", c=u["client_num"]):
-            if tg.send(int(tg_user["telegram_id"]), "📢 <b>رسالة من الإدارة</b>\n\n" + esc(msg)):
-                sent += 1
+        if tg.send(int(u["telegram_id"]), "📢 <b>رسالة من الإدارة</b>\n\n" + esc(msg)): sent += 1
     core.audit("ADMIN_BROADCAST", ctx, details="%s users" % sent)
     ctx.reset()
-    ctx.send("✅ تم إرسال الرسالة إلى %s مستخدم." % sent, kb([HOME_BTN]))
+    ctx.send("✅ أُرسلت إلى %s مستخدم." % sent, kb([HOME_BTN]))
 
 
-# ── الإحصائيات ──
 def _stats(ctx):
     stats = db.one(
         "SELECT "
@@ -4584,6 +3826,8 @@ def _stats(ctx):
         "(SELECT COUNT(*) FROM clients_table WHERE account_type = 'تجاري') AS shops, "
         "(SELECT COUNT(*) FROM clients_table WHERE account_type = 'فردي') AS individuals, "
         "(SELECT COUNT(*) FROM bot_sub_requests WHERE status='PENDING') AS pending, "
+        "(SELECT COUNT(*) FROM bot_user_accounts) AS total_links, "
+        "(SELECT COUNT(DISTINCT telegram_id) FROM bot_user_accounts) AS total_tg_users, "
         "(SELECT COUNT(*) FROM personal_expenses) AS total_expenses, "
         "(SELECT NVL(SUM(amount), 0) FROM personal_expenses) AS sum_expenses, "
         "(SELECT COUNT(*) FROM personal_income) AS total_income_rows, "
@@ -4594,21 +3838,16 @@ def _stats(ctx):
         "(SELECT COUNT(*) FROM products_table) AS total_products, "
         "(SELECT COUNT(*) FROM shop_customers) AS total_customers, "
         "(SELECT COUNT(*) FROM shop_debts) AS total_debts "
-        "FROM dual"
-    )
-    text = ("📊 <b>إحصائيات البوت الشاملة</b>\n\n"
-            "<b>👥 المستخدمون:</b>\n"
-            "الإجمالي: %s | نشط: %s | منتهي: %s\n"
-            "تجاري: %s | فردي: %s\n"
-            "طلبات معلقة: %s\n\n"
-            "<b>🛒 المتجر:</b>\n"
-            "المنتجات: %s | العملاء: %s | سجلات الديون: %s\n\n"
-            "<b>👤 القسم الفردي:</b>\n"
-            "المصاريف: %s عملية بقيمة %s\n"
-            "الدخل: %s عملية بقيمة %s\n"
-            "الديون الشخصية: %s سجل\n"
-            "المذكرات: %s | الأهداف: %s"
+        "FROM dual")
+    text = ("📊 <b>إحصائيات البوت</b>\n\n<b>👥 المستخدمون:</b>\n"
+            "الحسابات: %s | نشط: %s | منتهي: %s\n"
+            "حسابات تلجرام: %s | ارتباطات: %s\n"
+            "تجاري: %s | فردي: %s | طلبات: %s\n\n"
+            "<b>🛒 المتجر:</b>\nالمنتجات: %s | العملاء: %s | سجلات الديون: %s\n\n"
+            "<b>👤 القسم الفردي:</b>\nالمصاريف: %s بقيمة %s\nالدخل: %s بقيمة %s\n"
+            "الديون الشخصية: %s | المذكرات: %s | الأهداف: %s"
             % (stats["total_users"], stats["active_users"], stats["expired_users"],
+               stats["total_tg_users"], stats["total_links"],
                stats["shops"], stats["individuals"], stats["pending"],
                stats["total_products"], stats["total_customers"], stats["total_debts"],
                stats["total_expenses"], fmt_num(stats["sum_expenses"]),
@@ -4617,177 +3856,124 @@ def _stats(ctx):
     ctx.reply(text, kb([HOME_BTN]))
 
 
-# ── سعر الشهر ──
 @on_state("adm:price")
 def st_price(ctx):
     v = parse_int(ctx.text, 0, 999_999_999_999)
-    if v is None:
-        ctx.send("أدخل سعراً صحيحاً (رقم صحيح بدون كسور):")
-        return
+    if v is None: ctx.send("أدخل سعراً:"); return
     n = db.run("UPDATE system_settings SET month_price = :p_v WHERE id = 1", p_v=v)
-    if not n:
-        db.run("INSERT INTO system_settings (id, month_price) VALUES (1, :p_v)", p_v=v)
+    if not n: db.run("INSERT INTO system_settings (id, month_price) VALUES (1, :p_v)", p_v=v)
     core.audit("SET_MONTH_PRICE", ctx, details=str(v))
     ctx.reset()
-    ctx.send("✅ تم تحديث سعر الشهر إلى <b>%s</b> %s" % (fmt_num(v), cfg.SUB_PRICE_UNIT), kb([HOME_BTN]))
+    ctx.send("✅ سعر الشهر: <b>%s</b> %s" % (fmt_num(v), cfg.SUB_PRICE_UNIT), kb([HOME_BTN]))
 
 
 @on_state("adm:usd")
 def st_usd(ctx):
     v = parse_float(ctx.text, 0.0001, 10_000_000.0)
-    if v is None:
-        ctx.send("أدخل سعر الدولار (رقم أكبر من صفر):")
-        return
-    ctx.go("adm:sar", adm_usd=v)
-    ctx.send("أدخل سعر <b>الريال السعودي</b> الجديد:")
+    if v is None: ctx.send("أدخل سعر الدولار:"); return
+    ctx.go("adm:sar", adm_usd=v); ctx.send("أدخل سعر <b>الريال السعودي</b>:")
 
 
 @on_state("adm:sar")
 def st_sar(ctx):
     v = parse_float(ctx.text, 0.0001, 10_000_000.0)
     usd = ctx.data.get("adm_usd")
-    if v is None or usd is None:
-        ctx.send("أدخل سعر الريال السعودي (رقم أكبر من صفر):")
-        return
-    n = db.run("UPDATE exchange_rates SET usd_price = :p_u, sar_price = :p_s WHERE id = 1",
-               p_u=usd, p_s=v)
-    if not n:
-        db.run("INSERT INTO exchange_rates (id, usd_price, sar_price) VALUES (1, :p_u, :p_s)", p_u=usd, p_s=v)
+    if v is None or usd is None: ctx.send("أدخل السعر:"); return
+    n = db.run("UPDATE exchange_rates SET usd_price = :p_u, sar_price = :p_s WHERE id = 1", p_u=usd, p_s=v)
+    if not n: db.run("INSERT INTO exchange_rates (id, usd_price, sar_price) VALUES (1, :p_u, :p_s)", p_u=usd, p_s=v)
     core.audit("SET_RATES", ctx, details="usd=%s sar=%s" % (usd, v))
     ctx.reset()
-    ctx.send("✅ تم تحديث أسعار الصرف:\n💵 الدولار = %s\n🇸🇦 الريال السعودي = %s" % (fmt_num(usd), fmt_num(v)),
-             kb([HOME_BTN]))
+    ctx.send("✅ الأسعار:\n💵 الدولار = %s\n🇸🇦 السعودي = %s" % (fmt_num(usd), fmt_num(v)), kb([HOME_BTN]))
 '''
 
 # ════════════════════ router.py ════════════════════
 SOURCES['router'] = r'''"""توجيه التحديثات القادمة من تلجرام."""
 from __future__ import annotations
-
-import collections
-import logging
-
-import accounts
-import admin      # noqa: F401
-import core
-import menus
-import personal   # noqa: F401
-import pickers    # noqa: F401
-import reports    # noqa: F401
-import shop       # noqa: F401
-import subs
-import tg
+import collections, logging
+import accounts, admin, core, menus, personal, pickers, reports, shop, subs, support, tg
 from config import cfg
 from core import CB_H, LOCK, MEDIA_STATES, STATE_H, Ctx, esc
-
 log = logging.getLogger("router")
 
-FREE_CB_WHEN_EXPIRED = {"sub", "acct", "adm", "auth"}
+FREE_CB_WHEN_EXPIRED = {"sub", "acct", "adm", "auth", "support"}
 BUTTON_STATES = {"sale:negq", "sale:confirm", "imp:confirm", "pay:fullq", "setup:country", "setup:currency"}
 
-HELP = ("ℹ️ <b>المساعدة</b>\n\n"
-        "/start — البدء / القائمة الرئيسية\n"
-        "/menu — القائمة الرئيسية\n"
-        "/subscription — اشتراكي وتجديد الاشتراك\n"
-        "/cancel — إلغاء العملية الحالية\n"
-        "/logout — تسجيل الخروج\n"
-        "/id — معرفة رقم حسابك في تلجرام\n\n"
+HELP = ("ℹ️ <b>المساعدة</b>\n\n/start — البدء\n/menu — القائمة\n/subscription — اشتراكي\n"
+        "/cancel — إلغاء\n/logout — خروج\n/id — رقم حسابي\n/contact — التواصل\n\n"
         "💡 يمكنك كتابة الأرقام بالعربية أو الإنجليزية.")
 
-_seen = collections.deque()
-_seen_set = set()
-_SEEN_MAX = 3000
+_seen = collections.deque(); _seen_set = set(); _SEEN_MAX = 3000
 
 
 def _dup(update_id):
-    if update_id is None:
-        return False
-    if update_id in _seen_set:
-        return True
-    if len(_seen) >= _SEEN_MAX:
-        _seen_set.discard(_seen.popleft())
-    _seen.append(update_id)
-    _seen_set.add(update_id)
+    if update_id is None: return False
+    if update_id in _seen_set: return True
+    if len(_seen) >= _SEEN_MAX: _seen_set.discard(_seen.popleft())
+    _seen.append(update_id); _seen_set.add(update_id)
     return False
 
 
 def handle_update(update):
     ctx = Ctx(update)
-    if ctx.chat_id is None or ctx.user_id is None or ctx.chat_type != "private":
-        return
+    if ctx.chat_id is None or ctx.user_id is None or ctx.chat_type != "private": return
     with LOCK:
-        if _dup(ctx.update_id):
-            return
-        try:
-            _process(ctx)
+        if _dup(ctx.update_id): return
+        try: _process(ctx)
         except Exception as e:
-            log.exception("update %s failed", ctx.update_id)
-            _fail(ctx, e)
+            log.exception("update %s failed", ctx.update_id); _fail(ctx, e)
 
 
 def _fail(ctx, e):
     try:
         ctx.answer()
-        msg = "⚠️ حدث خطأ غير متوقع. حاول مرة أخرى أو أرسل /menu."
-        if ctx.is_admin:
-            msg += "\n<code>%s</code>" % esc(str(e)[:350])
+        msg = "⚠️ خطأ غير متوقع. أرسل /menu."
+        if ctx.is_admin: msg += "\n<code>%s</code>" % esc(str(e)[:350])
         tg.send(ctx.chat_id, msg)
-    except Exception:
-        log.exception("failed to report error")
+    except Exception: log.exception("failed to report error")
 
 
 def _process(ctx):
-    if ctx.is_cb:
-        ctx.answer()
+    if ctx.is_cb: ctx.answer()
     ctx.load_session()
     num = ctx.sess.get("client_num")
     if num:
         ctx.client = core.fetch_client(num)
-        if ctx.client is None:
-            ctx.unlink()
-        else:
-            ctx.sub = subs.status(ctx.client)
-    if ctx.is_cb:
-        return _cb(ctx)
+        if ctx.client is None: ctx.unlink()
+        else: ctx.sub = subs.status(ctx.client)
+    if ctx.is_cb: return _cb(ctx)
     text = (ctx.text or "").strip()
-    if text.startswith("/"):
-        return _cmd(ctx, text)
+    if text.startswith("/"): return _cmd(ctx, text)
     return _state(ctx)
 
 
 def _home_or_expired(ctx):
-    if ctx.sub and not ctx.sub["ok"]:
-        return subs.show_expired(ctx)
+    if ctx.sub and not ctx.sub["ok"]: return subs.show_expired(ctx)
     return menus.home(ctx)
 
 
 def _cmd(ctx, text):
     cmd = text.split()[0].split("@")[0].lower()
     if cmd == "/id":
-        ctx.send("🆔 رقم حسابك في تلجرام: <code>%s</code>" % ctx.user_id)
-        return
+        ctx.send("🆔 رقم حسابك: <code>%s</code>" % ctx.user_id); return
     if cmd == "/help":
-        ctx.send(HELP)
-        return
+        ctx.send(HELP); return
+    if cmd == "/contact":
+        ctx.args = ["home"]; return CB_H["support"](ctx)
     ctx.reset()
     if cmd in ("/start", "/menu", "/cancel"):
-        if ctx.client:
-            return _home_or_expired(ctx)
+        if ctx.client: return _home_or_expired(ctx)
         return accounts.start(ctx, fresh=True)
     if cmd in ("/subscription", "/sub"):
-        if ctx.client:
-            return subs.home(ctx) if ctx.sub["ok"] else subs.show_expired(ctx)
+        if ctx.client: return subs.home(ctx) if ctx.sub["ok"] else subs.show_expired(ctx)
         return accounts.start(ctx, fresh=True)
     if cmd == "/logout":
-        if ctx.client:
-            return accounts.logout(ctx)
+        if ctx.client: return accounts.logout(ctx)
         return accounts.start(ctx, fresh=True)
     if cmd == "/admin":
         if not ctx.is_admin:
-            ctx.send("⛔ هذا الأمر للمدير فقط.")
-            return
-        ctx.args = ["home"]
-        return CB_H["adm"](ctx)
-    ctx.send("أمر غير معروف. أرسل /help للمساعدة.")
+            ctx.send("⛔ للمدير فقط."); return
+        ctx.args = ["home"]; return CB_H["adm"](ctx)
+    ctx.send("أمر غير معروف. /help للمساعدة.")
 
 
 def _cb(ctx):
@@ -4795,13 +3981,10 @@ def _cb(ctx):
     prefix, ctx.args = parts[0], parts[1:]
     h = CB_H.get(prefix)
     if h is None:
-        ctx.answer("زر غير معروف")
-        return
-    if prefix in ("adm", "auth"):
-        return h(ctx)
+        ctx.answer("زر غير معروف"); return
+    if prefix in ("adm", "auth", "support"): return h(ctx)
     if not ctx.client:
-        ctx.send("سجّل الدخول أولاً: /start")
-        return
+        ctx.send("سجّل الدخول أولاً: /start"); return
     if not ctx.sub["ok"] and prefix not in FREE_CB_WHEN_EXPIRED:
         return subs.show_expired(ctx)
     return h(ctx)
@@ -4811,76 +3994,54 @@ def _state(ctx):
     st = ctx.state
     if not st:
         if ctx.client:
-            if ctx.sub["ok"]:
-                return menus.home(ctx, note="👇 اختر من القائمة")
+            if ctx.sub["ok"]: return menus.home(ctx, note="👇 اختر من القائمة")
             return subs.show_expired(ctx)
         return accounts.start(ctx, fresh=True)
     if st in BUTTON_STATES:
-        ctx.send("👆 اضغط أحد الأزرار في الرسالة السابقة، أو أرسل /cancel للإلغاء.")
-        return
+        ctx.send("👆 اضغط زراً من الرسالة، أو /cancel."); return
     h = STATE_H.get(st)
     if h is None:
         ctx.reset()
         return _home_or_expired(ctx) if ctx.client else accounts.start(ctx, fresh=True)
     if st.startswith(("reg:", "login:")):
         if ctx.client:
-            ctx.reset()
-            return _home_or_expired(ctx)
+            ctx.reset(); return _home_or_expired(ctx)
     elif st.startswith("adm:"):
         if not ctx.is_admin:
-            ctx.reset()
-            ctx.send("⛔ غير مسموح.")
-            return
+            ctx.reset(); ctx.send("⛔ غير مسموح."); return
     else:
         if not ctx.client:
-            ctx.reset()
-            return accounts.start(ctx, fresh=True)
+            ctx.reset(); return accounts.start(ctx, fresh=True)
         if not ctx.sub["ok"] and st != "sub:proof":
-            ctx.reset()
-            return subs.show_expired(ctx)
+            ctx.reset(); return subs.show_expired(ctx)
     if ctx.text is None and st not in MEDIA_STATES:
-        ctx.send("أرسل نصاً من فضلك (أو /cancel للإلغاء).")
-        return
+        ctx.send("أرسل نصاً (أو /cancel)."); return
     return h(ctx)
 '''
 
 # ════════════════════ server.py ════════════════════
 SOURCES['server'] = r'''"""خادم الويب (Webhook)."""
 from __future__ import annotations
-
-import hmac
-import json
-import logging
-import threading
+import hmac, json, logging, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-
-import db
-import router
-import subs
-import tg
+import db, router, subs, tg
 from config import cfg
-
 log = logging.getLogger("server")
 STATE = {"schema": None, "webhook": None, "db_error": None}
-_started = False
-_start_lock = threading.Lock()
-
+_started = False; _start_lock = threading.Lock()
 STATUS_LINES = {200: "200 OK", 400: "400 Bad Request", 401: "401 Unauthorized", 403: "403 Forbidden",
                 404: "404 Not Found", 413: "413 Payload Too Large", 500: "500 Internal Server Error"}
 
 
 def startup():
     if not cfg.BOT_TOKEN:
-        log.error("BOT_TOKEN غير موجود في متغيرات البيئة")
-        return
+        log.error("BOT_TOKEN غير موجود"); return
     try:
-        STATE["schema"] = db.ensure_schema()
-        STATE["db_error"] = None
-        log.info("schema report: %s", STATE["schema"])
+        STATE["schema"] = db.ensure_schema(); STATE["db_error"] = None
+        log.info("schema: %s", STATE["schema"])
     except Exception as e:
-        STATE["db_error"] = str(e)[:300]
-        log.error("DB init failed: %s", e)
+        STATE["db_error"] = str(e)[:300]; log.error("DB init failed: %s", e)
     tg.set_commands()
     if cfg.PUBLIC_URL:
         url = cfg.PUBLIC_URL + "/webhook"
@@ -4888,14 +4049,12 @@ def startup():
         STATE["webhook"] = url if ok else "FAILED: " + tg.last_error()
         log.info("webhook %s", STATE["webhook"])
     else:
-        STATE["webhook"] = "PUBLIC_URL غير محدد"
-        log.warning("PUBLIC_URL غير محدد: لن يتم تسجيل الويب هوك تلقائياً")
+        STATE["webhook"] = "PUBLIC_URL غير محدد"; log.warning("PUBLIC_URL غير محدد")
 
 
 def ensure_started():
     global _started
-    if _started:
-        return
+    if _started: return
     with _start_lock:
         if not _started:
             _started = True
@@ -4906,13 +4065,11 @@ def _json(status, obj):
     return status, "application/json; charset=utf-8", json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
 
-def _text(status, s):
-    return status, "text/plain; charset=utf-8", s.encode("utf-8")
+def _text(status, s): return status, "text/plain; charset=utf-8", s.encode("utf-8")
 
 
 def _key_ok(query, headers):
-    if not cfg.CRON_SECRET:
-        return False
+    if not cfg.CRON_SECRET: return False
     k = (query.get("key") or [""])[0] or headers.get("x-cron-key", "")
     return hmac.compare_digest(k, cfg.CRON_SECRET)
 
@@ -4920,55 +4077,40 @@ def _key_ok(query, headers):
 def process_http(method, path, query, headers, body):
     ensure_started()
     path = path.rstrip("/") or "/"
-    if path == "/" and method in ("GET", "HEAD"):
-        return _text(200, "OK")
+    if path == "/" and method in ("GET", "HEAD"): return _text(200, "OK")
     if path == "/webhook":
-        if method != "POST":
-            return _text(404, "not found")
+        if method != "POST": return _text(404, "not found")
         if not hmac.compare_digest(headers.get("x-telegram-bot-api-secret-token", ""), cfg.WEBHOOK_SECRET):
             return _text(403, "forbidden")
-        try:
-            update = json.loads(body.decode("utf-8"))
-        except Exception:
-            return _text(400, "bad request")
-        try:
-            router.handle_update(update)
-        except Exception:
-            log.exception("unhandled error in handle_update")
+        try: update = json.loads(body.decode("utf-8"))
+        except Exception: return _text(400, "bad request")
+        try: router.handle_update(update)
+        except Exception: log.exception("handle_update error")
         return _text(200, "ok")
     if path == "/health" and method in ("GET", "HEAD"):
-        try:
-            db.ping()
-            db_state = "ok"
+        try: db.ping(); db_state = "ok"
         except Exception as e:
-            db_state = "error"
-            STATE["db_error"] = str(e)[:300]
+            db_state = "error"; STATE["db_error"] = str(e)[:300]
         out = {"status": "ok", "db": db_state}
         if _key_ok(query, headers):
             out.update(webhook=STATE["webhook"], schema=STATE["schema"], db_error=STATE["db_error"],
                        registration=cfg.REGISTRATION_MODE, admins=len(cfg.ADMIN_IDS))
         return _json(200, out)
     if path == "/cron/reminders" and method in ("GET", "POST"):
-        if not _key_ok(query, headers):
-            return _text(403, "forbidden")
-        try:
-            return _json(200, {"sent": subs.run_reminders()})
+        if not _key_ok(query, headers): return _text(403, "forbidden")
+        try: return _json(200, {"sent": subs.run_reminders()})
         except Exception as e:
-            log.exception("reminders failed")
-            return _json(500, {"error": str(e)[:200]})
+            log.exception("reminders failed"); return _json(500, {"error": str(e)[:200]})
     return _text(404, "not found")
 
 
 class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    server_version = "ShopBot"
+    protocol_version = "HTTP/1.1"; server_version = "ShopBot"
 
     def _do(self, method):
         u = urlparse(self.path)
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
+        try: length = int(self.headers.get("Content-Length") or 0)
+        except ValueError: length = 0
         if length > 1_000_000:
             status, ctype, data = _text(413, "too large")
         else:
@@ -4979,20 +4121,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        if method != "HEAD":
-            self.wfile.write(data)
+        if method != "HEAD": self.wfile.write(data)
 
-    def do_GET(self):
-        self._do("GET")
-
-    def do_HEAD(self):
-        self._do("HEAD")
-
-    def do_POST(self):
-        self._do("POST")
-
-    def log_message(self, fmt, *args):
-        log.debug("http: " + fmt, *args)
+    def do_GET(self): self._do("GET")
+    def do_HEAD(self): self._do("HEAD")
+    def do_POST(self): self._do("POST")
+    def log_message(self, fmt, *args): log.debug("http: " + fmt, *args)
 
 
 def run():
@@ -5000,22 +4134,17 @@ def run():
     srv = ThreadingHTTPServer(("0.0.0.0", cfg.PORT), Handler)
     srv.daemon_threads = True
     log.info("listening on 0.0.0.0:%s", cfg.PORT)
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    try: srv.serve_forever()
+    except KeyboardInterrupt: pass
 
 
 def application(environ, start_response):
-    try:
-        length = int(environ.get("CONTENT_LENGTH") or 0)
-    except ValueError:
-        length = 0
+    try: length = int(environ.get("CONTENT_LENGTH") or 0)
+    except ValueError: length = 0
     body = environ["wsgi.input"].read(length) if 0 < length <= 1_000_000 else b""
     headers = {}
     for k, v in environ.items():
-        if k.startswith("HTTP_"):
-            headers[k[5:].replace("_", "-").lower()] = v
+        if k.startswith("HTTP_"): headers[k[5:].replace("_", "-").lower()] = v
     status, ctype, data = process_http(environ.get("REQUEST_METHOD", "GET"), environ.get("PATH_INFO", "/"),
                                        parse_qs(environ.get("QUERY_STRING", "")), headers, body)
     start_response(STATUS_LINES.get(status, "%d" % status),
@@ -5027,26 +4156,16 @@ def application(environ, start_response):
 SOURCES['app'] = r'''"""نقطة التشغيل."""
 import logging
 from config import cfg
-
-logging.basicConfig(
-    level=getattr(logging, cfg.LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-
+logging.basicConfig(level=getattr(logging, cfg.LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 from server import application, run  # noqa: E402,F401
-
-if __name__ == "__main__":
-    run()
+if __name__ == "__main__": run()
 '''
 
 
 class _Loader(importlib.abc.Loader):
-    def __init__(self, name):
-        self.name = name
-
-    def create_module(self, spec):
-        return None
-
+    def __init__(self, name): self.name = name
+    def create_module(self, spec): return None
     def exec_module(self, module):
         code = compile(SOURCES[self.name], self.name + ".py", "exec", dont_inherit=True)
         exec(code, module.__dict__)
@@ -5076,3 +4195,4 @@ def __getattr__(name):
 
 if __name__ == "__main__":
     main()
+
