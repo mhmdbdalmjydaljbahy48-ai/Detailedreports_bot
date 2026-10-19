@@ -88,8 +88,9 @@ class Config:
         self.SUPPORT_PHONE_1 = _s("SUPPORT_PHONE_1", "738439579")
         self.SUPPORT_PHONE_2 = _s("SUPPORT_PHONE_2", "785068462")
         self.SUPPORT_COUNTRY_CODE = _s("SUPPORT_COUNTRY_CODE", "967")
-        self.SUPPORT_INSTAGRAM = _s("SUPPORT_INSTAGRAM", "")
-        self.SUPPORT_MESSENGER = _s("SUPPORT_MESSENGER", "")
+        self.SUPPORT_INSTAGRAM = _s("SUPPORT_INSTAGRAM", "faisalalqahtanifffff")
+        self.SUPPORT_TELEGRAM = _s("SUPPORT_TELEGRAM", "https://t.me/+967734427533")
+        self.SUPPORT_MESSENGER = _s("SUPPORT_MESSENGER", "https://m.me/faisalalqahtanifffff")
         self.SUPPORT_WHATSAPP_MSG = _s("SUPPORT_WHATSAPP_MSG", "مرحباً، أريد الاستفسار عن النظام")
 
         # ── عام ──
@@ -498,6 +499,7 @@ import math
 import os
 import re
 import threading
+from datetime import datetime
 
 import db
 import tg
@@ -600,6 +602,30 @@ def fmt_date(d):
         return d.strftime("%Y-%m-%d")
     except Exception:
         return str(d)
+
+
+def fmt_remaining(expiry_date):
+    if not expiry_date:
+        return "-"
+    try:
+        if isinstance(expiry_date, str):
+            exp_dt = datetime.strptime(expiry_date.split(".")[0], "%Y-%m-%d %H:%M:%S")
+        else:
+            exp_dt = expiry_date
+        now = datetime.now()
+        diff = exp_dt - now
+        if diff.total_seconds() <= 0:
+            return "منتهي"
+        days = diff.days
+        hours, remainder = divmod(diff.seconds, 3600)
+        minutes, _ = divmod(remainder, 60)
+        parts = []
+        if days > 0: parts.append(f"{days} يوم")
+        if hours > 0: parts.append(f"{hours} ساعة")
+        if minutes > 0 or (days == 0 and hours == 0): parts.append(f"{minutes} دقيقة")
+        return " و ".join(parts)
+    except Exception:
+        return "-"
 
 
 MONTH_LABELS = {
@@ -876,7 +902,7 @@ class Ctx:
 '''
 
 # ════════════════════ support.py ════════════════════
-SOURCES['support'] = r'''"""قسم التواصل بنا: هاتف + واتساب + إنستغرام + ماسنجر. يظهر قبل التسجيل وبعده وللحسابات المنتهية."""
+SOURCES['support'] = r'''"""قسم التواصل بنا."""
 from __future__ import annotations
 from urllib.parse import quote
 import core
@@ -885,10 +911,13 @@ from core import BACK_HOME, esc, on_cb, kb
 
 
 def _full_phone(num):
-    n = (num or "").strip().lstrip("+")
-    if n.startswith(cfg.SUPPORT_COUNTRY_CODE):
+    n = "".join(filter(str.isdigit, str(num or "")))
+    if not n:
+        return ""
+    code = "".join(filter(str.isdigit, str(cfg.SUPPORT_COUNTRY_CODE)))
+    if n.startswith(code) and len(n) > len(code):
         return n
-    return cfg.SUPPORT_COUNTRY_CODE + n
+    return code + n
 
 
 def _url_kb(*rows):
@@ -920,10 +949,15 @@ def support_home(ctx, note=None):
             + f"<b>الهاتف الأول:</b> {esc(p1)}\n"
             + f"<b>الهاتف الثاني:</b> {esc(p2)}\n\n"
             + "💡 اختر قناة التواصل المناسبة لك:")
-    rows = [
-        [("💬 واتساب 1", f"https://wa.me/{full1}?text={wa_msg}"),
-         ("💬 واتساب 2", f"https://wa.me/{full2}?text={wa_msg}")],
-    ]
+    
+    rows = []
+    if full1:
+        rows.append([("💬 واتساب 1", f"https://wa.me/{full1}?text={wa_msg}")])
+    if full2:
+        rows.append([("💬 واتساب 2", f"https://wa.me/{full2}?text={wa_msg}")])
+    
+    if cfg.SUPPORT_TELEGRAM:
+        rows.append([("✈️ تلجرام", cfg.SUPPORT_TELEGRAM)])
     if cfg.SUPPORT_INSTAGRAM:
         insta = cfg.SUPPORT_INSTAGRAM.lstrip("@").strip()
         rows.append([("📸 إنستغرام", f"https://instagram.com/{insta}")])
@@ -931,13 +965,20 @@ def support_home(ctx, note=None):
         m = cfg.SUPPORT_MESSENGER.strip()
         m_url = m if m.startswith(("http://", "https://")) else f"https://m.me/{m}"
         rows.append([("💬 ماسنجر", m_url)])
-    rows.append([("📞 اتصال 1", f"tel:+{full1}"), ("📞 اتصال 2", f"tel:+{full2}")])
+    
+    tel_row = []
+    if full1: tel_row.append(("📞 اتصال 1", f"tel:+{full1}"))
+    if full2: tel_row.append(("📞 اتصال 2", f"tel:+{full2}"))
+    if tel_row:
+        rows.append(tel_row)
+        
     rows.append([BACK_HOME])
     ctx.reply(text, _url_kb(*rows))
 
 
 @on_cb("support")
 def cb_support(ctx):
+    ctx.reset()
     support_home(ctx)
 '''
 
@@ -953,7 +994,8 @@ def sub_line(ctx):
     if s.get("days") is None:
         return ""
     d = int(s["days"])
-    line = "⏳ متبقي من اشتراكك: <b>%s</b> يوم" % d
+    rem_text = core.fmt_remaining(ctx.client.get("expiry_date"))
+    line = "⏳ متبقي من اشتراكك: <b>%s</b>" % rem_text
     if d <= 7:
         line += "\n⚠️ <b>تنبيه:</b> اشتراكك على وشك الانتهاء، جدّده من زر ⭐ اشتراكي"
     return line
@@ -1394,7 +1436,7 @@ def info(ctx):
     lines += ["", "<b>الاشتراك</b>", "ينتهي في: %s" % core.fmt_date(c.get("expiry_date"))]
     s = ctx.sub or {}
     if s.get("days") is not None:
-        lines.append("المتبقي: %s يوم" % int(s["days"]))
+        lines.append("المتبقي: %s" % core.fmt_remaining(c.get("expiry_date")))
     rows = [[("⭐ اشتراكي", "sub:home")]]
     if core.db.val("SELECT COUNT(*) FROM bot_user_accounts WHERE telegram_id = :t", 0, t=ctx.user_id) > 1:
         rows.append([("🔄 تبديل الحساب", "acct:switch")])
@@ -1502,7 +1544,8 @@ def home(ctx):
     elif s.get("expired"):
         lines.append("الحالة: ❌ منتهي")
     else:
-        lines.append("الحالة: ✅ ساري" + (" — متبقي %s يوم" % int(s["days"]) if s.get("days") is not None else ""))
+        rem_text = core.fmt_remaining(c.get("expiry_date"))
+        lines.append("الحالة: ✅ ساري — متبقي <b>%s</b>" % rem_text)
     lines.append("سعر الشهر: %s %s" % (fmt_num(price), cfg.SUB_PRICE_UNIT) if price else "سعر الشهر: يحدده المدير")
     ctx.reply("\n".join(lines), kb([("🔄 تجديد / تمديد الاشتراك", "sub:plans")],
                                    [("📜 طلباتي", "sub:list")],
@@ -2577,8 +2620,8 @@ def bal_cust_picked(ctx, c):
     ctx.reply("\n".join(lines), kb([("📝 كشف آخر", "pay:bal")], [("↩️ رجوع", "pay:menu"), BACK_HOME]))
 '''
 
-# ════════════════════ personal.py (مُصلح) ════════════════════
-SOURCES['personal'] = r'''"""القسم الفردي الشامل — نسخة مصححة (معالج واحد فقط لـ per)."""
+# ════════════════════ personal.py ════════════════════
+SOURCES['personal'] = r'''"""القسم الفردي الشامل."""
 from __future__ import annotations
 import logging
 from urllib.parse import quote
@@ -2600,7 +2643,6 @@ def _month_cond(): return "date(created_at) >= date('now', 'localtime', 'start o
 def _today_cond(): return "date(created_at) = date('now', 'localtime')"
 
 
-# ═══════════════════ المعالج الوحيد لكل أزرار القسم الفردي ═══════════════════
 @on_cb("per")
 def cb_per(ctx):
     a = ctx.args
@@ -2608,7 +2650,6 @@ def cb_per(ctx):
     action = a[1] if len(a) > 1 else ""
     arg = a[2] if len(a) > 2 else ""
 
-    # ── القائمة الرئيسية ──
     if section == "menu":
         ctx.reset()
         ctx.reply("👤 <b>القسم الفردي الشامل</b>\nاختر القسم:",
@@ -2619,7 +2660,6 @@ def cb_per(ctx):
                      [("📞 تواصل معنا", "support:home")], [BACK_HOME]))
         return
 
-    # ── المصاريف ──
     if section == "exp":
         if not action: return _exp_menu(ctx)
         if action == "cat" and arg in EXPENSE_CATS:
@@ -2636,7 +2676,6 @@ def cb_per(ctx):
         if action == "list": return _exp_list(ctx, 0)
         if action == "listpage" and arg.isdigit(): return _exp_list(ctx, int(arg))
 
-    # ── الدخل ──
     elif section == "inc":
         if not action: return _inc_menu(ctx)
         if action == "add":
@@ -2647,11 +2686,9 @@ def cb_per(ctx):
         if action == "month": return _inc_month(ctx)
         if action == "list": return _inc_list(ctx)
 
-    # ── المحفظة ──
     elif section == "wallet":
         return _wallet(ctx)
 
-    # ── الديون ──
     elif section == "debt":
         if not action: return _debt_menu(ctx)
         if action == "for":
@@ -2670,7 +2707,6 @@ def cb_per(ctx):
         if action == "wa" and arg.isdigit(): return _debt_whatsapp(ctx, int(arg))
         if action == "del" and arg.isdigit(): return _debt_delete(ctx, int(arg))
 
-    # ── المذكرات ──
     elif section == "note":
         if not action: return _note_menu(ctx)
         if action == "add":
@@ -2684,7 +2720,6 @@ def cb_per(ctx):
         if action == "view" and arg.isdigit(): return _note_view(ctx, int(arg))
         if action == "del" and arg.isdigit(): return _note_delete(ctx, int(arg))
 
-    # ── الأهداف ──
     elif section == "goal":
         if not action: return _goal_menu(ctx)
         if action == "add":
@@ -2700,7 +2735,6 @@ def cb_per(ctx):
             return ctx.reply("أدخل مبلغ الإيداع:", kb([("❌ إلغاء", "per:goal")]))
         if action == "del" and arg.isdigit(): return _goal_delete(ctx, int(arg))
 
-    # ── الالتزامات ──
     elif section == "obl":
         if not action: return _obl_menu(ctx)
         if action == "add":
@@ -2732,7 +2766,6 @@ def _menu(ctx):
                  [("📞 تواصل معنا", "support:home")], [BACK_HOME]))
 
 
-# ═══════════════════ المصاريف ═══════════════════
 def _exp_menu(ctx):
     ctx.reset()
     ctx.reply("💸 <b>المصاريف</b>\nاختر التصنيف:",
@@ -2798,7 +2831,6 @@ def _exp_list(ctx, page):
     ctx.reply("\n".join(lines), kb(*rows_btns))
 
 
-# ═══════════════════ الدخل ═══════════════════
 def _inc_menu(ctx):
     ctx.reset()
     ctx.reply("💰 <b>الدخل</b>",
@@ -2868,7 +2900,6 @@ def _inc_list(ctx):
     ctx.reply("\n".join(lines), kb([("➕ دخل", "per:inc")], [("↩️ رجوع", "per:inc"), BACK_HOME]))
 
 
-# ═══════════════════ المحفظة ═══════════════════
 def _wallet(ctx):
     cn = _cn(ctx); u = _u(ctx)
     today = db.one("SELECT "
@@ -2889,7 +2920,6 @@ def _wallet(ctx):
     ctx.reply(text, kb([("💸 صرف", "per:exp"), ("💰 دخل", "per:inc")], [("↩️ رجوع", "per:menu"), BACK_HOME]))
 
 
-# ═══════════════════ الديون الشخصية ═══════════════════
 def _debt_menu(ctx):
     cn = _cn(ctx); u = _u(ctx)
     for_me = db.one("SELECT NVL(SUM(amount - paid_amount), 0) AS t, COUNT(*) AS c FROM personal_debts "
@@ -3062,7 +3092,6 @@ def _debt_delete(ctx, did):
     ctx.reply("✅ تم الحذف." if n else "⚠️ غير موجود.", kb([("🤝 الديون", "per:debt"), BACK_HOME]))
 
 
-# ═══════════════════ المذكرات ═══════════════════
 def _note_menu(ctx):
     ctx.reset()
     ctx.reply("📝 <b>المذكرات</b>", kb([("➕ إضافة", "per:note:add")], [("📋 عرض", "per:note:list")],
@@ -3119,7 +3148,6 @@ def _note_delete(ctx, nid):
     ctx.reply("✅ تم الحذف.", kb([("📝 المذكرات", "per:note"), BACK_HOME]))
 
 
-# ═══════════════════ الأهداف ═══════════════════
 def _goal_menu(ctx):
     ctx.reset()
     ctx.reply("🎯 <b>الأهداف</b>", kb([("➕ إضافة", "per:goal:add")], [("📊 متابعة", "per:goal:list")],
@@ -3189,7 +3217,6 @@ def _goal_delete(ctx, gid):
     ctx.reply("✅ تم الحذف.", kb([("🎯 الأهداف", "per:goal"), BACK_HOME]))
 
 
-# ═══════════════════ الالتزامات ═══════════════════
 def _obl_menu(ctx):
     ctx.reset()
     ctx.reply("🔔 <b>الالتزامات</b>", kb([("➕ إضافة", "per:obl:add")], [("📊 حالة", "per:obl:list")],
@@ -3261,7 +3288,6 @@ def _obl_delete(ctx, oid):
     ctx.reply("✅ تم الحذف.", kb([("🔔 الالتزامات", "per:obl"), BACK_HOME]))
 
 
-# ═══════════════════ التقرير الشامل ═══════════════════
 def _report(ctx):
     cn = _cn(ctx); u = _u(ctx)
     db.run("UPDATE personal_obligations SET is_paid_this_month = 0 "
@@ -3301,9 +3327,6 @@ def _report(ctx):
                        [("📞 تواصل معنا", "support:home")], [BACK_HOME]))
 '''
 
-
-
-
 # ════════════════════ reports.py ════════════════════
 SOURCES['reports'] = r'''
 def page_sql(base_sql, page, per_page):
@@ -3311,9 +3334,8 @@ def page_sql(base_sql, page, per_page):
     return "SELECT * FROM (%s) LIMIT %d OFFSET %d" % (base_sql, per_page + 1, off)
 '''
 
-
-# ════════════════════ admin.py (الشامل مع إضافة مستخدمين) ════════════════════
-SOURCES['admin'] = r'''"""لوحة الإدارة الشاملة — تحكم كامل بالبوت (للمدراء فقط: ADMIN_IDS)."""
+# ════════════════════ admin.py ════════════════════
+SOURCES['admin'] = r'''"""لوحة الإدارة الشاملة."""
 from __future__ import annotations
 import logging
 import core, db, subs, tg
@@ -3321,6 +3343,7 @@ from config import cfg
 from core import (BACK_HOME, duration_label, esc, fmt_date, fmt_dt, fmt_num, kb, on_cb, on_state,
                   parse_float, parse_int, store_password)
 from reports import page_sql
+
 log = logging.getLogger("admin")
 HOME_BTN = ("🛡 لوحة الإدارة", "adm:home")
 
@@ -3357,6 +3380,7 @@ def cb_adm(ctx):
     elif act == "edit" and arg.isdigit(): client_edit_menu(ctx, int(arg))
     elif act == "editf" and arg.isdigit(): _edit_field(ctx, int(arg), arg2)
     elif act == "toggle" and arg.isdigit(): toggle(ctx, int(arg))
+    elif act == "expire" and arg.isdigit(): expire_user(ctx, int(arg))
     elif act == "del" and arg.isdigit(): _confirm_delete(ctx, int(arg))
     elif act == "delyes" and arg.isdigit(): _do_delete(ctx, int(arg))
     elif act == "reset" and arg.isdigit(): _confirm_reset(ctx, int(arg))
@@ -3484,7 +3508,8 @@ def client_detail(ctx, num):
                  [("✏️ تعديل البيانات", "adm:edit:%s" % num)],
                  [("➕ إضافة حساب إضافي", "adm:addacct:%s" % num)],
                  [("✅ تفعيل" if st["blocked"] else "⛔ إيقاف", "adm:toggle:%s" % num)],
-                 [("🔄 تصفير", "adm:reset:%s" % num)],
+                 [("🚫 تصفير الاشتراك", "adm:expire:%s" % num)],
+                 [("🔄 تصفير البيانات", "adm:reset:%s" % num)],
                  [("🗑 حذف", "adm:del:%s" % num)],
                  [("👥 المشتركون", "adm:subs:0"), HOME_BTN]))
 
@@ -3502,6 +3527,13 @@ def toggle(ctx, num):
         subs.notify_client(num, "⛔ تم إيقاف حسابك. للاستفسار تواصل مع الإدارة.",
                            kb([("📞 تواصل معنا", "support:home"), BACK_HOME]))
     client_detail(ctx, num)
+
+
+def expire_user(ctx, num):
+    db.run("UPDATE clients_table SET expiry_date = datetime('now', 'localtime', '-1 day') WHERE num = :p_n", p_n=num)
+    core.audit("ADMIN_EXPIRE_SUB", ctx, client_num=num)
+    ctx.reply("✅ تم تصفير اشتراك المستخدم %s (انتهت المدة)." % num,
+              kb([("👤 تفاصيل", "adm:c:%s" % num), HOME_BTN]))
 
 
 def ask_extend_type(ctx, num):
@@ -3648,7 +3680,6 @@ def _do_reset(ctx, num):
     ctx.reply("✅ تم تصفير بيانات المستخدم %s." % num, kb([("👤 تفاصيل", "adm:c:%s" % num), HOME_BTN]))
 
 
-# ─────────── إنشاء مستخدم جديد ───────────
 @on_state("adm:newuser_tgid")
 def st_newuser_tgid(ctx):
     raw = (ctx.text or "").strip()
@@ -3733,7 +3764,6 @@ def st_newuser_months(ctx):
     ctx.send(msg, kb([("👤 تفاصيل", "adm:c:%s" % num), ("🆕 آخر", "adm:newuser"), HOME_BTN]))
 
 
-# ─────────── إضافة حساب إضافي لمستخدم موجود ───────────
 def _add_account_to_user(ctx, client_num):
     links = db.rows("SELECT DISTINCT telegram_id FROM bot_user_accounts WHERE client_num = :n", n=client_num)
     if not links:
@@ -3911,6 +3941,7 @@ import collections, logging
 import accounts, admin, core, menus, personal, pickers, reports, shop, subs, support, tg
 from config import cfg
 from core import CB_H, LOCK, MEDIA_STATES, STATE_H, Ctx, esc
+
 log = logging.getLogger("router")
 
 FREE_CB_WHEN_EXPIRED = {"sub", "acct", "adm", "auth", "support"}
@@ -4046,6 +4077,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 import db, router, subs, tg
 from config import cfg
+
 log = logging.getLogger("server")
 STATE = {"schema": None, "webhook": None, "db_error": None}
 _started = False; _start_lock = threading.Lock()
@@ -4181,7 +4213,7 @@ from server import application, run  # noqa: E402,F401
 if __name__ == "__main__": run()
 '''
 
-
+# ════════════════════ محمل الوحدات (Loader) ════════════════════
 class _Loader(importlib.abc.Loader):
     def __init__(self, name): self.name = name
     def create_module(self, spec): return None
