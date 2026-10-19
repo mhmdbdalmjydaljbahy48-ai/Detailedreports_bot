@@ -401,6 +401,12 @@ def _chunks(text, size=MAX_LEN):
     return out
 
 
+def _bad_url_error():
+    return ("BUTTON_URL_INVALID" in _last_error or
+            "unsupported URL protocol" in _last_error or
+            "inline keyboard button URL" in _last_error)
+
+
 def send(chat_id, text, markup=None, parse_mode="HTML"):
     chunks = _chunks(text)
     res = None
@@ -414,6 +420,10 @@ def send(chat_id, text, markup=None, parse_mode="HTML"):
         if res is None and "parse entities" in _last_error:
             params.pop("parse_mode", None)
             params["text"] = strip_tags(ch) or "…"
+            res = call("sendMessage", **params)
+        if res is None and _bad_url_error():
+            log.warning("invalid url button in markup, sending without keyboard")
+            params.pop("reply_markup", None)
             res = call("sendMessage", **params)
     return res
 
@@ -431,6 +441,10 @@ def edit(chat_id, message_id, text, markup=None):
     if res is None and "parse entities" in _last_error:
         params.pop("parse_mode", None)
         params["text"] = strip_tags(text) or "…"
+        res = call("editMessageText", **params)
+    if res is None and _bad_url_error():
+        log.warning("invalid url button in markup (edit), retrying without keyboard")
+        params.pop("reply_markup", None)
         res = call("editMessageText", **params)
     return res is not None
 
@@ -928,7 +942,10 @@ def _url_kb(*rows):
             if item is None:
                 continue
             t, action = item[0], item[1]
-            if action.startswith(("https://", "http://", "tg://", "tel:")):
+            # تلجرام لا يدعم tel: في أزرار الإنلاين — تخطَّها بدل كسر الرسالة بالكامل
+            if action.startswith("tel:"):
+                continue
+            if action.startswith(("https://", "http://", "tg://")):
                 r.append({"text": t, "url": action})
             else:
                 r.append({"text": t, "callback_data": action})
@@ -948,14 +965,13 @@ def support_home(ctx, note=None):
             + "\nنحن هنا لمساعدتك في أي وقت.\n\n"
             + f"<b>الهاتف الأول:</b> {esc(p1)}\n"
             + f"<b>الهاتف الثاني:</b> {esc(p2)}\n\n"
-            + "💡 اختر قناة التواصل المناسبة لك:")
-    
+            + "💡 اضغط على الرقم مباشرة للاتصال، أو اختر قناة تواصل:")
+
     rows = []
     if full1:
         rows.append([("💬 واتساب 1", f"https://wa.me/{full1}?text={wa_msg}")])
     if full2:
         rows.append([("💬 واتساب 2", f"https://wa.me/{full2}?text={wa_msg}")])
-    
     if cfg.SUPPORT_TELEGRAM:
         rows.append([("✈️ تلجرام", cfg.SUPPORT_TELEGRAM)])
     if cfg.SUPPORT_INSTAGRAM:
@@ -965,13 +981,7 @@ def support_home(ctx, note=None):
         m = cfg.SUPPORT_MESSENGER.strip()
         m_url = m if m.startswith(("http://", "https://")) else f"https://m.me/{m}"
         rows.append([("💬 ماسنجر", m_url)])
-    
-    tel_row = []
-    if full1: tel_row.append(("📞 اتصال 1", f"tel:+{full1}"))
-    if full2: tel_row.append(("📞 اتصال 2", f"tel:+{full2}"))
-    if tel_row:
-        rows.append(tel_row)
-        
+
     rows.append([BACK_HOME])
     ctx.reply(text, _url_kb(*rows))
 
@@ -981,7 +991,6 @@ def cb_support(ctx):
     ctx.reset()
     support_home(ctx)
 '''
-
 # ════════════════════ menus.py ════════════════════
 SOURCES['menus'] = r'''"""القائمة الرئيسية."""
 from __future__ import annotations
@@ -1820,7 +1829,6 @@ def run_reminders():
                p_c=r["num"], p_e=r["expiry_date"], p_k=kind)
     return sent
 '''
-
 # ════════════════════ pickers.py ════════════════════
 SOURCES['pickers'] = r'''"""أدوات البحث والاختيار المشتركة (عملاء ومنتجات)."""
 from __future__ import annotations
@@ -3333,7 +3341,6 @@ def page_sql(base_sql, page, per_page):
     off = max(0, int(page)) * int(per_page)
     return "SELECT * FROM (%s) LIMIT %d OFFSET %d" % (base_sql, per_page + 1, off)
 '''
-
 # ════════════════════ admin.py ════════════════════
 SOURCES['admin'] = r'''"""لوحة الإدارة الشاملة."""
 from __future__ import annotations
