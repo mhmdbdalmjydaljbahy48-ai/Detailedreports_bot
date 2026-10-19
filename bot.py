@@ -3293,6 +3293,266 @@ def _report(ctx):
 
 
 
+# ════════════════════ reports.py ════════════════════
+SOURCES['reports'] = r'''"""التقارير الشاملة والتعديلات — مطابق Statement.java."""
+from __future__ import annotations
+import logging, core, db
+from core import (BACK_HOME, LIKE_ESC, clean_text, esc, fmt_dt, fmt_num, kb, like, on_cb, on_state, parse_int, stock_text, unit_of)
+from pickers import (cust_purpose, debt_totals, find_products, get_customer, prod_purpose, start_cust_search, start_prod_search)
+from shop import KIND_LABEL, archive_and_delete_debts
+log = logging.getLogger("reports")
+
+SALES_TABLE = {"c": ("cash_sales", "sale_date", "total_amount"), "n": ("network_sales", "sale_date", "total_amount"), "d": ("shop_debts", "debt_date", "debt_amount")}
+SEP = "─────────────"
+
+def _u(ctx): return unit_of(ctx.client)
+def _cond(col, period): return "TRUNC(%s) = TRUNC(SYSDATE)" % col if period == "day" else "TRUNC(%s, 'MM') = TRUNC(SYSDATE, 'MM')" % col
+def page_sql(sql, page, size): return ("SELECT * FROM (SELECT q.*, ROWNUM AS rn__ FROM (%s) q WHERE ROWNUM <= %d) WHERE rn__ > %d" % (sql, page * size + size + 1, page * size))
+def _page_arg(r, idx): return int(r[idx]) if len(r) > idx and r[idx].isdigit() else 0
+
+def show_page(ctx, title, lines, page, has_next, base, back, header=None):
+    text = title + ("\n" + header if header else "") + "\n\n" + ("\n".join(lines) if lines else "⚠️ لا توجد بيانات.")
+    if page or has_next: text += "\n\n<i>صفحة %d</i>" % (page + 1)
+    nav = []
+    if page > 0: nav.append(("◀️ السابق", "%s:%d" % (base, page - 1)))
+    if has_next: nav.append(("التالي ▶️", "%s:%d" % (base, page + 1)))
+    rows = ([nav] if nav else []) + [[("↩️ رجوع", back), BACK_HOME]]
+    ctx.reply(text, kb(*rows))
+
+def _back(ctx, text, back, extra_rows=None):
+    rows = (extra_rows or []) + [[("↩️ رجوع", back), BACK_HOME]]
+    ctx.reply(text, kb(*rows))
+
+@on_cb("rp")
+def cb_rp(ctx):
+    a = ctx.args; sec = a[0] if a else "menu"; fn = SECTIONS.get(sec)
+    if sec == "menu" or fn is None:
+        ctx.reset()
+        ctx.reply("===== 📊 شاشة التقارير الشاملة والتعديلات =====\nاختر رقم التقرير:", kb([("1. المنتجات", "rp:1"), ("2. العملاء", "rp:2")], [("3. كشف المبيعات والاستيراد", "rp:3")], [("4. الأرباح", "rp:4"), ("5. الديون", "rp:5")], [("6. التعديلات (حذف)", "rp:6")], [("7. بحث عن عمليات بيع", "rp:7")], [("8. تقرير حركة المنتجات", "rp:8")], [BACK_HOME]))
+        return
+    fn(ctx, a[1:])
+
+def sec_products(ctx, r):
+    cn = ctx.client["num"]; sub = r[0] if r else None; u = _u(ctx)
+    if sub is None:
+        ctx.reset()
+        ctx.reply("--- 📦 تقارير المنتجات ---\n📦 إجمالي عدد المنتجات المسجلة: <b>%s</b> منتج" % db.val("SELECT COUNT(*) FROM products_table", 0), kb([("🚚 حساب عدد الكراتين المستوردة", "rp:1:cartons")], [("🔎 بحث عن منتج معين", "rp:1:search")], [("📋 كشف بجميع المنتجات (مع التفاصيل)", "rp:1:all:0")], [("↩️ رجوع", "rp:menu"), BACK_HOME]))
+    elif sub == "cartons":
+        v = db.val("SELECT NVL(SUM(number_of_cartons), 0) FROM imports_table WHERE client_num = :p_cn", 0, p_cn=cn)
+        _back(ctx, "📦 إجمالي الكراتين التي قمت باستيرادها: <b>%s</b> كرتون" % fmt_num(v), "rp:1")
+    elif sub == "search":
+        ctx.go("rp:psearch"); ctx.reply("أدخل اسم المنتج للبحث:", kb([("↩️ رجوع", "rp:1")]))
+    elif sub == "all":
+        page = _page_arg(r, 1)
+        rows = db.rows(page_sql("SELECT product_name, NVL(purchase_price, 0) AS pp, NVL(price, 0) AS sp, NVL(quantity, 0) AS qty, NVL(units_per_carton, 1) AS upc FROM products_table ORDER BY product_name", page, 8))
+        lines = ["📦 <b>%s</b>\nالشراء: %s | البيع: %s | الربح: %s\nالمتبقي: %s" % (esc(x["product_name"]), fmt_num(x["pp"]), fmt_num(x["sp"]), fmt_num(float(x["sp"]) - float(x["pp"])), stock_text(x["qty"], x["upc"])) for x in rows[:8]]
+        show_page(ctx, "--- 📋 كشف جميع المنتجات (التفصيلي) ---", lines, page, len(rows) > 8, "rp:1:all", "rp:1")
+
+@on_state("rp:psearch")
+def st_psearch(ctx):
+    q = (ctx.text or "").strip()
+    if not q: ctx.send("أدخل اسم المنتج للبحث:"); return
+    rows = find_products(q); ctx.reset()
+    if not rows: ctx.send("⚠️ المنتج غير موجود.", kb([("🔁 بحث آخر", "rp:1:search"), ("↩️ رجوع", "rp:1")])); return
+    u = _u(ctx)
+    lines = ["📦 <b>%s</b> | السعر: %s %s | المتبقي: %s" % (esc(x["product_name"]), fmt_num(x["price"]), u, stock_text(x["quantity"], x["units_per_carton"])) for x in rows[:10]]
+    if len(rows) > 10: lines.append("… (يوجد نتائج أكثر، حدّد الاسم بدقة)")
+    ctx.send("\n".join(lines), kb([("🔁 بحث آخر", "rp:1:search"), ("↩️ رجوع", "rp:1")]))
+
+def sec_customers(ctx, r):
+    cn = ctx.client["num"]; sub = r[0] if r else None; u = _u(ctx)
+    if sub is None:
+        ctx.reset()
+        ctx.reply("--- 👥 تقارير العملاء ---\n👥 إجمالي عدد عملائك: <b>%s</b> عميل" % db.val("SELECT COUNT(*) FROM shop_customers WHERE client_num = :p_cn", 0, p_cn=cn), kb([("🔎 بحث عن عميل (كشف حساب للديون)", "rp:2:search")], [("📋 كشف بجميع العملاء (مع إجمالي الديون)", "rp:2:all:0")], [("↩️ رجوع", "rp:menu"), BACK_HOME]))
+    elif sub == "search": start_cust_search(ctx, "rp_cust", back="rp:2")
+    elif sub == "all":
+        page = _page_arg(r, 1)
+        rows = db.rows(page_sql("SELECT c.customer_name AS cname, c.customer_phone AS cphone, NVL(SUM(d.debt_amount - NVL(d.paid_amount, 0)), 0) AS remain FROM shop_customers c LEFT JOIN shop_debts d ON c.customer_phone = d.customer_phone AND c.client_num = d.client_num WHERE c.client_num = :p_cn GROUP BY c.customer_name, c.customer_phone ORDER BY c.customer_name", page, 15), p_cn=cn)
+        lines = ["- العميل: <b>%s</b> | الرقم: %s | دينه المتبقي: %s %s" % (esc(x["cname"]), x["cphone"], fmt_num(x["remain"]), u) for x in rows[:15]]
+        show_page(ctx, "--- 📋 قائمة جميع العملاء (مع الأرصدة) ---", lines, page, len(rows) > 15, "rp:2:all", "rp:2")
+
+@cust_purpose("rp_cust")
+def rp_cust_picked(ctx, c):
+    td, tp, rem = debt_totals(c["phone"], ctx.client["num"]); u = _u(ctx); ctx.reset()
+    _back(ctx, "👤 العميل: <b>%s</b> | الرقم: %s\nإجمالي الدين: %s | إجمالي ما سدده: %s | المتبقي عليه: <b>%s</b> %s" % (esc(c["name"]), c["phone"], fmt_num(td), fmt_num(tp), fmt_num(rem), u), "rp:2", [[("📄 ملف كشف الحساب", "stm:%s" % c["phone"])]])
+
+def sec_sales(ctx, r):
+    cn = ctx.client["num"]; sub = r[0] if r else None; u = _u(ctx)
+    if sub is None:
+        ctx.reset(); ctx.reply("--- 📊 تقارير المبيعات والاستيراد ---", kb([("💰 المبيعات اليومية (كاش فقط)", "rp:3:1")], [("📅 المبيعات الشهرية (كاش + تسديدات الديون)", "rp:3:2")], [("🚛 الاستيراد الشهري", "rp:3:3")], [("💵 تسديدات الديون (المسددة فقط)", "rp:3:4")], [("📊 كشف المبيعات التحليلي الشامل", "rp:3:5")], [("↩️ رجوع", "rp:menu"), BACK_HOME]))
+    elif sub == "1":
+        cash = db.val("SELECT NVL(SUM(total_amount), 0) FROM cash_sales WHERE client_num = :p_cn AND " + _cond("sale_date", "day"), 0, p_cn=cn)
+        net = db.val("SELECT NVL(SUM(total_amount), 0) FROM network_sales WHERE client_num = :p_cn AND " + _cond("sale_date", "day"), 0, p_cn=cn)
+        _back(ctx, "💰 إجمالي المبيعات اليومية (نقداً فقط): <b>%s</b> %s\n💳 مبيعات الشبكة اليوم: %s %s" % (fmt_num(cash), u, fmt_num(net), u), "rp:3")
+    elif sub == "2":
+        cash = db.val("SELECT NVL(SUM(total_amount), 0) FROM cash_sales WHERE client_num = :p_cn AND " + _cond("sale_date", "month"), 0, p_cn=cn)
+        net = db.val("SELECT NVL(SUM(total_amount), 0) FROM network_sales WHERE client_num = :p_cn AND " + _cond("sale_date", "month"), 0, p_cn=cn)
+        paid = db.val("SELECT NVL(SUM(paid_amount), 0) FROM shop_debts WHERE client_num = :p_cn AND " + _cond("debt_date", "month"), 0, p_cn=cn)
+        _back(ctx, "📅 <b>مبيعات هذا الشهر</b>\n💰 كاش: %s %s\n💳 شبكة: %s %s\n💵 تسديدات الديون: %s %s\n%s\nالإجمالي (كاش + تسديدات): <b>%s</b> %s\nالإجمالي مع مبيعات الشبكة: <b>%s</b> %s" % (fmt_num(cash), u, fmt_num(net), u, fmt_num(paid), u, SEP, fmt_num(float(cash) + float(paid)), u, fmt_num(float(cash) + float(net) + float(paid)), u), "rp:3")
+    elif sub == "3":
+        v = db.val("SELECT NVL(SUM(full_amount), 0) FROM imports_table WHERE client_num = :p_cn AND " + _cond("import_date", "month"), 0, p_cn=cn)
+        _back(ctx, "🚛 إجمالي الاستيراد هذا الشهر: <b>%s</b> %s" % (fmt_num(v), u), "rp:3")
+    elif sub == "4":
+        v = db.val("SELECT NVL(SUM(paid_amount), 0) FROM shop_debts WHERE client_num = :p_cn", 0, p_cn=cn)
+        _back(ctx, "💵 إجمالي تسديدات الديون المستلمة: <b>%s</b> %s" % (fmt_num(v), u), "rp:3")
+    elif sub == "5":
+        row = db.one("SELECT (SELECT NVL(SUM(total_amount),0) FROM cash_sales WHERE client_num = :p_cn AND TRUNC(sale_date) = TRUNC(SYSDATE)) AS today_cash, (SELECT NVL(SUM(total_amount),0) FROM network_sales WHERE client_num = :p_cn AND TRUNC(sale_date) = TRUNC(SYSDATE)) AS today_network, (SELECT NVL(SUM(debt_amount),0) FROM shop_debts WHERE client_num = :p_cn AND TRUNC(debt_date) = TRUNC(SYSDATE)) AS today_debt, (SELECT NVL(SUM(total_amount),0) FROM cash_sales WHERE client_num = :p_cn AND TRUNC(sale_date, 'MM') = TRUNC(SYSDATE, 'MM')) AS month_cash, (SELECT NVL(SUM(total_amount),0) FROM network_sales WHERE client_num = :p_cn AND TRUNC(sale_date, 'MM') = TRUNC(SYSDATE, 'MM')) AS month_network, (SELECT NVL(SUM(debt_amount),0) FROM shop_debts WHERE client_num = :p_cn AND TRUNC(debt_date, 'MM') = TRUNC(SYSDATE, 'MM')) AS month_new_debt, (SELECT NVL(SUM(paid_amount),0) FROM shop_debts WHERE client_num = :p_cn AND TRUNC(debt_date, 'MM') = TRUNC(SYSDATE, 'MM')) AS month_paid_debt, (SELECT NVL(SUM(debt_amount - NVL(paid_amount, 0)),0) FROM shop_debts WHERE client_num = :p_cn) AS total_remaining_debts FROM dual", p_cn=cn)
+        f = lambda k: float(row[k] or 0)
+        _back(ctx, "===== 📊 كشف المبيعات التحليلي =====\n\n<b>🟢 المبيعات اليومية (اليوم)</b>\n💰 كاش: %s %s\n💳 شبكة: %s %s\n📝 ديون مسجلة اليوم: %s %s\nإجمالي مبيعات اليوم: <b>%s</b> %s\n\n<b>🔵 المبيعات الشهرية (هذا الشهر)</b>\n💰 كاش: %s %s\n💳 شبكة: %s %s\n📝 ديون جديدة هذا الشهر: %s %s\n\n<b>🔴 حركة الديون</b>\n✅ الديون المُسددة (المستلمة) هذا الشهر: %s %s\n⚠️ إجمالي الديون المتبقية في السوق: <b>%s</b> %s" % (fmt_num(f("today_cash")), u, fmt_num(f("today_network")), u, fmt_num(f("today_debt")), u, fmt_num(f("today_cash") + f("today_network") + f("today_debt")), u, fmt_num(f("month_cash")), u, fmt_num(f("month_network")), u, fmt_num(f("month_new_debt")), u, fmt_num(f("month_paid_debt")), u, fmt_num(f("total_remaining_debts")), u), "rp:3")
+
+def _profit_sql(period):
+    parts = ["SELECT '%s' AS src, product_name, single_price, quantity FROM %s WHERE client_num = :p_cn AND %s" % (src, table, _cond(col, period)) for src, table, col in (("cash", "cash_sales", "sale_date"), ("net", "network_sales", "sale_date"), ("debt", "shop_debts", "debt_date"))]
+    return "SELECT s.src AS src, NVL(SUM((s.single_price - NVL(p.purchase_price, 0)) * s.quantity), 0) AS profit FROM (" + " UNION ALL ".join(parts) + ") s JOIN products_table p ON LOWER(s.product_name) = LOWER(p.product_name) GROUP BY s.src"
+
+def sec_profits(ctx, r):
+    sub = r[0] if r else None; u = _u(ctx)
+    if sub is None:
+        ctx.reset(); ctx.reply("--- 💹 تقارير الأرباح الصافية ---", kb([("📈 الأرباح اليومية", "rp:4:day")], [("📊 الأرباح الشهرية", "rp:4:month")], [("↩️ رجوع", "rp:menu"), BACK_HOME]))
+    elif sub in ("day", "month"):
+        rows = db.rows(_profit_sql(sub), p_cn=ctx.client["num"]); v = {x["src"].strip(): float(x["profit"] or 0) for x in rows}; cash, net, debt = v.get("cash", 0.0), v.get("net", 0.0), v.get("debt", 0.0)
+        _back(ctx, "%s (بعد خصم رأس المال)\n💰 أرباح الكاش: <b>%s</b> %s\n💳 أرباح الشبكة: %s %s\n📝 أرباح الديون المسجلة: %s %s\n%s\nالإجمالي: <b>%s</b> %s" % ("📈 صافي أرباح اليوم" if sub == "day" else "📊 صافي أرباح هذا الشهر", fmt_num(cash), u, fmt_num(net), u, fmt_num(debt), u, SEP, fmt_num(cash + net + debt), u), "rp:4")
+
+def sec_debts(ctx, r):
+    cn = ctx.client["num"]; sub = r[0] if r else None; u = _u(ctx)
+    if sub is None:
+        ctx.reset(); ctx.reply("--- 🔴 تقارير الديون ---\n🔴 إجمالي الديون في السوق: <b>%s</b> %s" % (fmt_num(db.val("SELECT NVL(SUM(debt_amount - NVL(paid_amount, 0)), 0) FROM shop_debts WHERE client_num = :p_cn", 0, p_cn=cn)), u), kb([("👤 كشف حساب لعميل محدد", "rp:5:cust")], [("📋 كشف ديون جميع العملاء (الشامل)", "rp:5:all:0")], [("🔢 بحث عن دين برقم الفاتورة", "rp:5:inv")], [("↩️ رجوع", "rp:menu"), BACK_HOME]))
+    elif sub == "cust": start_cust_search(ctx, "rp_debt", back="rp:5")
+    elif sub == "all":
+        page = _page_arg(r, 1)
+        rows = db.rows(page_sql("SELECT customer_name, product_name, quantity, debt_amount, NVL(paid_amount, 0) AS paid, debt_date, invoice_num FROM shop_debts WHERE client_num = :p_cn ORDER BY customer_name, debt_id", page, 10), p_cn=cn)
+        lines = ["العميل: <b>%s</b> | المنتج: %s | الكمية: %s | المبلغ: %s %s%s | الوقت: %s" % (esc(x["customer_name"]), esc(x["product_name"]), fmt_num(x["quantity"]), fmt_num(x["debt_amount"]), u, " (مسدد %s)" % fmt_num(x["paid"]) if float(x["paid"] or 0) else "", fmt_dt(x["debt_date"])) for x in rows[:10]]
+        if not rows and page == 0: lines = ["السوق نظيف، لا توجد ديون حالياً!"]
+        show_page(ctx, "--- 📋 الكشف الشامل لجميع ديون السوق ---", lines, page, len(rows) > 10, "rp:5:all", "rp:5")
+    elif sub == "inv":
+        ctx.go("rp:dinv"); ctx.reply("أدخل رقم الفاتورة للبحث:", kb([("↩️ رجوع", "rp:5")]))
+
+@on_state("rp:dinv")
+def st_dinv(ctx):
+    n = parse_int(ctx.text, 0)
+    if n is None: ctx.send("أدخل رقم الفاتورة (أرقام فقط):"); return
+    x = db.one("SELECT customer_name, product_name, quantity, debt_amount, debt_date FROM shop_debts WHERE invoice_num = :p_n AND client_num = :p_cn", p_n=n, p_cn=ctx.client["num"])
+    ctx.reset()
+    if not x: ctx.send("⚠️ لم يتم العثور على أي دين يحمل رقم الفاتورة هذا.", kb([("↩️ رجوع", "rp:5")])); return
+    ctx.send("--- 🧾 تفاصيل فاتورة الدين رقم [%s] ---\n👤 العميل: %s\n📦 المنتج: %s\n🔢 الكمية: %s\n💰 إجمالي الدين: <b>%s</b> %s\n📅 تاريخ الفاتورة: %s" % (n, esc(x["customer_name"]), esc(x["product_name"]), fmt_num(x["quantity"]), fmt_num(x["debt_amount"]), _u(ctx), fmt_dt(x["debt_date"])), kb([("🖨️ ملف الفاتورة", "inv:d:%s" % n)], [("↩️ رجوع", "rp:5"), BACK_HOME]))
+
+@cust_purpose("rp_debt")
+def rp_debt_picked(ctx, c):
+    cn = ctx.client["num"]; u = _u(ctx)
+    rows = db.rows("SELECT * FROM (SELECT product_name, quantity, debt_amount, debt_date FROM shop_debts WHERE customer_phone = :p_ph AND client_num = :p_cn ORDER BY debt_id) WHERE ROWNUM <= 40", p_ph=c["phone"], p_cn=cn)
+    td, tp, rem = debt_totals(c["phone"], cn); ctx.reset()
+    lines = ["--- كشف حساب العميل [<b>%s</b>] ---" % esc(c["name"])]
+    if not rows:
+        lines.append("لا توجد ديون مسجلة باسم هذا العميل."); _back(ctx, "\n".join(lines), "rp:5"); return
+    for x in rows: lines.append("المنتج: %s | الكمية: %s | المبلغ: %s %s | الوقت: %s" % (esc(x["product_name"]), fmt_num(x["quantity"]), fmt_num(x["debt_amount"]), u, fmt_dt(x["debt_date"])))
+    lines += [SEP, "إجمالي الديون المسجلة عليه: <b>%s</b> %s" % (fmt_num(td), u), "المسدد: %s | المتبقي: <b>%s</b> %s" % (fmt_num(tp), fmt_num(rem), u)]
+    _back(ctx, "\n".join(lines), "rp:5", [[("🖨️ طباعة كشف الحساب (ملف)", "stm:%s" % c["phone"])]])
+
+def sec_modify(ctx, r):
+    sub = r[0] if r else None
+    if sub is None:
+        ctx.reset(); ctx.reply("--- ✏️ قسم التعديلات ---\n⚠️ الحذف يتم بعد تأكيدك.", kb([("🗑 حذف عميل", "rp:6:c")], [("🗑 حذف منتج", "rp:6:p")], [("🗑 حذف ديون عميل", "rp:6:d")], [("↩️ رجوع", "rp:menu"), BACK_HOME]))
+    elif sub == "c": start_cust_search(ctx, "delc", back="rp:6")
+    elif sub == "p": start_prod_search(ctx, "delp", prompt="أدخل اسم المنتج لحذفه:", back="rp:6")
+    elif sub == "d": start_cust_search(ctx, "deld", back="rp:6")
+
+@cust_purpose("delc")
+def delc_picked(ctx, c):
+    td, tp, rem = debt_totals(c["phone"], ctx.client["num"])
+    warn = "\n⚠️ عليه دين متبقي %s %s (ستبقى سجلات الدين ولن تُحذف)." % (fmt_num(rem), _u(ctx)) if rem > 0 else ""
+    ctx.reset(); ctx.reply("🗑 تأكيد حذف العميل <b>%s</b> (%s)؟%s" % (esc(c["name"]), c["phone"], warn), kb([("✅ نعم، احذف", "del:c:%s" % c["phone"])], [("❌ إلغاء", "rp:6")]))
+
+@prod_purpose("delp")
+def delp_picked(ctx, p):
+    ctx.reset(); ctx.reply("🗑 تأكيد حذف المنتج <b>%s</b>؟" % esc(p["product_name"]), kb([("✅ نعم، احذف", "del:p:%s" % p["product_id"])], [("❌ إلغاء", "rp:6")]))
+
+@cust_purpose("deld")
+def deld_picked(ctx, c):
+    td, tp, rem = debt_totals(c["phone"], ctx.client["num"]); ctx.reset()
+    ctx.reply("🗑 تأكيد تصفير وحذف جميع ديون العميل <b>%s</b>؟\nالمتبقي عليه: %s %s\n<i>(تُحفظ نسخة في الأرشيف)</i>" % (esc(c["name"]), fmt_num(rem), _u(ctx)), kb([("✅ نعم، احذف", "del:d:%s" % c["phone"])], [("❌ إلغاء", "rp:6")]))
+
+@on_cb("del")
+def cb_del(ctx):
+    a = ctx.args
+    if len(a) < 2 or not a[1].isdigit(): return
+    kind, ident, cn = a[0], int(a[1]), ctx.client["num"]; back = [[("↩️ رجوع", "rp:6"), BACK_HOME]]
+    if kind == "c":
+        n = db.run("DELETE FROM shop_customers WHERE customer_phone = :p_ph AND client_num = :p_cn", p_ph=ident, p_cn=cn); core.audit("DELETE_CUSTOMER", ctx, details="phone=%s" % ident)
+    elif kind == "p":
+        n = db.run("DELETE FROM products_table WHERE product_id = :p_id", p_id=ident); core.audit("DELETE_PRODUCT", ctx, details="id=%s" % ident)
+    elif kind == "d":
+        with db.tx() as t: n = archive_and_delete_debts(t, cn, ident, "DELETED"); core.audit("DELETE_DEBTS", ctx, details="phone=%s rows=%s" % (ident, n), t=t)
+    else: return
+    ctx.reset(); ctx.reply("✅ تم الحذف بنجاح!" if n else "⚠️ لم يتم العثور على بيانات.", kb(*back))
+
+def _union_sql(period):
+    return " UNION ALL ".join(["SELECT '%s' AS s_type, invoice_num, customer_name, customer_phone, product_name, quantity, %s AS amt, %s AS dt FROM %s WHERE client_num = :p_cn AND %s" % (typ, amt, col, table, _cond(col, period)) for typ, (table, col, amt) in (("cash", SALES_TABLE["c"]), ("net", SALES_TABLE["n"]), ("debt", SALES_TABLE["d"]))])
+
+def sec_search(ctx, r):
+    cn = ctx.client["num"]; sub = r[0] if r else None; u = _u(ctx)
+    if sub is None:
+        ctx.reset(); ctx.reply("--- 🔍 بحث وتقارير المبيعات التفصيلية ---", kb([("💳 مبيعات الشبكة", "rp:7:n"), ("💰 مبيعات الكاش", "rp:7:c")], [("📝 مبيعات الديون", "rp:7:d")], [("📋 تقرير مفصل بجميع عمليات اليوم", "rp:7:day:0")], [("📋 تقرير مفصل بجميع عمليات الشهر", "rp:7:month:0")], [("↩️ رجوع", "rp:menu"), BACK_HOME]))
+    elif sub in SALES_TABLE:
+        ctx.reply("طريقة البحث في مبيعات %s:" % {"c": "الكاش", "n": "الشبكة", "d": "الديون"}[sub], kb([("🔢 برقم الفاتورة", "rp:7:q:%s:inv" % sub)], [("👤 باسم الزبون", "rp:7:q:%s:name" % sub)], [("📞 برقم هاتف الزبون", "rp:7:q:%s:phone" % sub)], [("↩️ رجوع", "rp:7")]))
+    elif sub == "q" and len(r) > 2 and r[1] in SALES_TABLE and r[2] in ("inv", "name", "phone"):
+        ctx.go("rp:sq", rq_kind=r[1], rq_crit=r[2]); ctx.reply({"inv": "أدخل رقم الفاتورة:", "name": "أدخل اسم الزبون:", "phone": "أدخل رقم الهاتف:"}[r[2]], kb([("↩️ رجوع", "rp:7")]))
+    elif sub in ("day", "month"):
+        page = _page_arg(r, 1); union = _union_sql(sub)
+        rows = db.rows(page_sql("SELECT s_type, invoice_num, customer_name, customer_phone, product_name, quantity, amt, dt FROM (" + union + ") ORDER BY dt DESC", page, 8), p_cn=cn)
+        names = {"cash": "كاش", "net": "شبكة", "debt": "دين"}; lines = []
+        for x in rows[:8]: lines.append("🔖 [%s] | الفاتورة: %s | %s\n👤 %s (%s)\n📦 %s | الكمية: %s | <b>%s</b> %s" % (names[x["s_type"].strip()], x["invoice_num"] if x["invoice_num"] is not None else "-", fmt_dt(x["dt"]), esc(x["customer_name"]), x["customer_phone"] or 0, esc(x["product_name"]), fmt_num(x["quantity"]), fmt_num(x["amt"]), u))
+        header = None
+        if page == 0:
+            tot = {x["s_type"].strip(): float(x["total"] or 0) for x in db.rows("SELECT s_type, NVL(SUM(amt), 0) AS total FROM (" + union + ") GROUP BY s_type", p_cn=cn)}
+            if tot: header = ("💰 إجمالي الكاش: %s\n💳 إجمالي الشبكة: %s\n📝 إجمالي الديون: %s\n💵 الإجمالي الكلي: <b>%s</b> %s" % (fmt_num(tot.get("cash", 0)), fmt_num(tot.get("net", 0)), fmt_num(tot.get("debt", 0)), fmt_num(sum(tot.values())), u))
+        if not rows and page == 0: lines = ["⚠️ لا توجد أي مبيعات مسجلة في %s." % ("اليوم" if sub == "day" else "هذا الشهر")]
+        show_page(ctx, "=== 📋 التقرير المفصل لجميع عمليات (%s) ===" % ("اليوم" if sub == "day" else "هذا الشهر"), lines, page, len(rows) > 8, "rp:7:" + sub, "rp:7", header)
+
+@on_state("rp:sq")
+def st_sq(ctx):
+    kind, crit = ctx.data.get("rq_kind"), ctx.data.get("rq_crit")
+    if kind not in SALES_TABLE or crit not in ("inv", "name", "phone"): ctx.reset(); ctx.send("انتهت.", kb([("🔍 بحث", "rp:7")])); return
+    table, dcol, amt = SALES_TABLE[kind]
+    sql = ("SELECT customer_name, customer_phone, product_name, quantity, single_price, %s AS total_amt, invoice_num, %s AS d_date FROM %s WHERE client_num = :p_cn AND " % (amt, dcol, table))
+    if crit == "name":
+        v = (ctx.text or "").strip()
+        if not v: ctx.send("أدخل اسم الزبون:"); return
+        sql += "LOWER(customer_name) LIKE :p_v" + LIKE_ESC; v = like(v)
+    else:
+        v = parse_int(ctx.text, 0, 999_999_999_999_999)
+        if v is None: ctx.send("أدخل رقماً صحيحاً (أرقام فقط):"); return
+        sql += ("invoice_num = :p_v" if crit == "inv" else "customer_phone = :p_v")
+    rows = db.rows("SELECT * FROM (" + sql + " ORDER BY " + dcol + " DESC) WHERE ROWNUM <= 16", p_cn=ctx.client["num"], p_v=v); ctx.reset(); u = _u(ctx)
+    if not rows: ctx.send("⚠️ لا توجد نتائج مطابقة لبحثك.", kb([("🔁 بحث آخر", "rp:7:%s" % kind), ("↩️ رجوع", "rp:7")])); return
+    lines = ["--- 🧾 نتائج البحث في قسم (%s) ---" % {"c": "الكاش", "n": "الشبكة", "d": "الديون"}[kind]]
+    for x in rows[:15]: lines.append("الفاتورة: %s | الزبون: %s (%s)\nالمنتج: %s | الكمية: %s | الإجمالي: <b>%s</b> %s | %s\n%s" % (x["invoice_num"] if x["invoice_num"] is not None else "-", esc(x["customer_name"]), x["customer_phone"] or 0, esc(x["product_name"]), fmt_num(x["quantity"]), fmt_num(x["total_amt"]), u, fmt_dt(x["d_date"]), SEP))
+    if len(rows) > 15: lines.append("… (يوجد نتائج أكثر، حدّد البحث)")
+    btns = [[("🖨️ فاتورة %s" % x["invoice_num"], "inv:%s:%s" % (kind, x["invoice_num"]))] for x in rows[:5] if x["invoice_num"] is not None]
+    ctx.send("\n".join(lines), kb(*(btns + [[("🔁 بحث آخر", "rp:7:%s" % kind), ("↩️ رجوع", "rp:7")]])))
+
+def _sold_sql():
+    return ("SELECT product_name, SUM(month_qty) AS total_month, SUM(today_qty) AS total_today FROM (" + " UNION ALL ".join(["SELECT product_name, quantity AS month_qty, CASE WHEN TRUNC(%s) = TRUNC(SYSDATE) THEN quantity ELSE 0 END AS today_qty FROM %s WHERE client_num = :p_cn AND %s" % (col, table, _cond(col, "month")) for table, col in (("cash_sales", "sale_date"), ("network_sales", "sale_date"), ("shop_debts", "debt_date"))]) + ") GROUP BY product_name")
+
+def sec_movement(ctx, r):
+    cn = ctx.client["num"]; page = _page_arg(r, 1) if r and r[0] == "p" else 0; u = _u(ctx); header = None
+    if page == 0:
+        top = db.one("SELECT * FROM (" + _sold_sql() + " ORDER BY total_month DESC) WHERE ROWNUM = 1", p_cn=cn)
+        if top: header = ("🌟 <b>المنتج الأكثر مبيعاً:</b> %s\n   - بيع منه هذا الشهر: %s حبة\n   - بيع منه اليوم: %s حبة" % (esc(top["product_name"]), fmt_num(top["total_month"]), fmt_num(top["total_today"])))
+        else: header = "🌟 المنتج الأكثر مبيعاً: لا توجد مبيعات مسجلة هذا الشهر."
+    rows = db.rows(page_sql("SELECT p.product_name AS pname, NVL(p.purchase_price, 0) AS pp, NVL(p.price, 0) AS sp, (NVL(p.price, 0) - NVL(p.purchase_price, 0)) AS prof, NVL(p.quantity, 0) AS stock_qty, NVL(p.units_per_carton, 1) AS ucarton, NVL(s.total_today, 0) AS today_sold, NVL(s.total_month, 0) AS month_sold FROM products_table p LEFT JOIN (" + _sold_sql() + ") s ON p.product_name = s.product_name ORDER BY p.product_name", page, 6), p_cn=cn)
+    lines = []
+    for x in rows[:6]:
+        uc = int(x["ucarton"] or 1) or 1; stock = int(x["stock_qty"])
+        lines.append("📦 <b>%s</b>\n💵 الشراء: %s | 💰 البيع: %s | 📈 الربح: %s %s\n📊 بيع اليوم: %s حبة | الشهر: %s حبة\n🏢 المتبقي: %s كرتون و %s حبة (إجمالي %s)" % (esc(x["pname"]), fmt_num(x["pp"]), fmt_num(x["sp"]), fmt_num(x["prof"]), u, fmt_num(x["today_sold"]), fmt_num(x["month_sold"]), stock // uc if stock >= 0 else 0, stock % uc if stock >= 0 else stock, fmt_num(stock)))
+    if not rows and page == 0: lines = ["⚠️ لم يتم العثور على أي منتجات في قاعدة البيانات."]
+    show_page(ctx, "===== 📦 تقرير حركة المنتجات والأرباح الشامل =====", lines, page, len(rows) > 6, "rp:8:p", "rp:menu", header)
+
+SECTIONS = {"1": sec_products, "2": sec_customers, "3": sec_sales, "4": sec_profits, "5": sec_debts, "6": sec_modify, "7": sec_search, "8": sec_movement}
+'''
+
+
+
+
+
 
 # ════════════════════ admin.py (الشامل مع إضافة مستخدمين) ════════════════════
 SOURCES['admin'] = r'''"""لوحة الإدارة الشاملة — تحكم كامل بالبوت (للمدراء فقط: ADMIN_IDS)."""
