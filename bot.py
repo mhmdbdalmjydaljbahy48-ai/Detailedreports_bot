@@ -165,7 +165,7 @@ class Tx:
 
     def _cur(self, sql, p):
         cur = self.conn.cursor()
-        if "bot_req_seq.NEXTVAL" in sql.upper():
+        if "BOT_REQ_SEQ.NEXTVAL" in sql.upper():
             cur.execute("SELECT IFNULL(MAX(req_id), 0) + 1 FROM bot_sub_requests")
             return cur
         tsql = translate_sql(sql)
